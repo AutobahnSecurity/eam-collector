@@ -1,0 +1,13 @@
+[Unit]
+Description=EAM Collector — AI Usage Agent
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/eam-collector
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
