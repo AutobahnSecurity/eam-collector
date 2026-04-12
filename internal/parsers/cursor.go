@@ -38,6 +38,16 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		return nil, prevState, nil
 	}
 
+	// Only collect if Cursor's database was modified within the lookback window.
+	// This prevents reporting stale data from an installed-but-unused Cursor.
+	info, err := os.Stat(p.dbPath)
+	if err != nil {
+		return nil, prevState, fmt.Errorf("stat cursor db: %w", err)
+	}
+	if time.Since(info.ModTime()) > p.lookback {
+		return nil, prevState, nil
+	}
+
 	var lastTS float64
 	if v, ok := prevState["last_processed_ts"]; ok {
 		if f, ok := v.(float64); ok {
