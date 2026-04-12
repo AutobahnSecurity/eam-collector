@@ -174,18 +174,24 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 	currentIdentity := parsers.ReadClaudeIdentity()
 	sessionIDs := loadSessionIdentities(store)
 
-	// Track sessions in this batch for state cleanup
-	activeSessions := make(map[string]bool)
 	for _, r := range allRecords {
-		activeSessions[r.SessionID] = true
-		if _, exists := sessionIDs[r.SessionID]; !exists && currentIdentity != nil {
-			sessionIDs[r.SessionID] = *currentIdentity
+		entry, exists := sessionIDs[r.SessionID]
+		if !exists && currentIdentity != nil {
+			sessionIDs[r.SessionID] = sessionIdentityEntry{
+				Identity: *currentIdentity,
+				LastSeen: time.Now(),
+			}
+		} else if exists {
+			// Refresh last-seen so active sessions don't expire
+			entry.LastSeen = time.Now()
+			sessionIDs[r.SessionID] = entry
 		}
 	}
 
-	// Remove sessions no longer in the lookback window
-	for sid := range sessionIDs {
-		if !activeSessions[sid] {
+	// Expire identities not seen for 7 days (handles paused sessions that resume)
+	const identityTTL = 7 * 24 * time.Hour
+	for sid, entry := range sessionIDs {
+		if time.Since(entry.LastSeen) > identityTTL {
 			delete(sessionIDs, sid)
 		}
 	}
@@ -200,9 +206,9 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 	for _, r := range allRecords {
 		orgKey := ""
 		var id *parsers.AccountIdentity
-		if stored, ok := sessionIDs[r.SessionID]; ok {
-			orgKey = stored.OrganizationUUID
-			id = &stored
+		if entry, ok := sessionIDs[r.SessionID]; ok {
+			orgKey = entry.Identity.OrganizationUUID
+			id = &entry.Identity
 		}
 		b := groups[orgKey]
 		if b == nil {
@@ -246,9 +252,14 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 	}
 }
 
+type sessionIdentityEntry struct {
+	Identity parsers.AccountIdentity
+	LastSeen time.Time
+}
+
 // loadSessionIdentities restores the session→identity map from state.
-func loadSessionIdentities(store *state.Store) map[string]parsers.AccountIdentity {
-	result := make(map[string]parsers.AccountIdentity)
+func loadSessionIdentities(store *state.Store) map[string]sessionIdentityEntry {
+	result := make(map[string]sessionIdentityEntry)
 	raw, ok := store.Get("_identities")["sessions"]
 	if !ok {
 		return result
@@ -265,25 +276,35 @@ func loadSessionIdentities(store *state.Store) map[string]parsers.AccountIdentit
 		acct, _ := idMap["account_uuid"].(string)
 		org, _ := idMap["organization_uuid"].(string)
 		tool, _ := idMap["tool"].(string)
-		if acct != "" {
-			result[sid] = parsers.AccountIdentity{
+		lastSeenStr, _ := idMap["last_seen"].(string)
+		if acct == "" {
+			continue
+		}
+		lastSeen, err := time.Parse(time.RFC3339, lastSeenStr)
+		if err != nil {
+			lastSeen = time.Now() // treat unparseable as fresh
+		}
+		result[sid] = sessionIdentityEntry{
+			Identity: parsers.AccountIdentity{
 				AccountUUID:      acct,
 				OrganizationUUID: org,
 				Tool:             tool,
-			}
+			},
+			LastSeen: lastSeen,
 		}
 	}
 	return result
 }
 
 // saveSessionIdentities persists the session→identity map to state.
-func saveSessionIdentities(store *state.Store, identities map[string]parsers.AccountIdentity) {
-	m := make(map[string]any, len(identities))
-	for sid, id := range identities {
+func saveSessionIdentities(store *state.Store, entries map[string]sessionIdentityEntry) {
+	m := make(map[string]any, len(entries))
+	for sid, entry := range entries {
 		m[sid] = map[string]any{
-			"account_uuid":      id.AccountUUID,
-			"organization_uuid": id.OrganizationUUID,
-			"tool":              id.Tool,
+			"account_uuid":      entry.Identity.AccountUUID,
+			"organization_uuid": entry.Identity.OrganizationUUID,
+			"tool":              entry.Identity.Tool,
+			"last_seen":         entry.LastSeen.Format(time.RFC3339),
 		}
 	}
 	store.Set("_identities", map[string]any{"sessions": m})
