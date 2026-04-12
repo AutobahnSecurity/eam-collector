@@ -54,6 +54,7 @@ brews:
     license: "Proprietary"
     install: |
       bin.install "eam-collector"
+      (etc/"eam-collector").mkpath
       etc.install "config.example.yaml" => "eam-collector/config.example.yaml"
     post_install: |
       config_dir = Pathname.new("#{Dir.home}/.eam-collector")
