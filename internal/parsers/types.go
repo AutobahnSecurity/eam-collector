@@ -22,11 +22,21 @@ type Record struct {
 	AIVendor     string  `json:"ai_vendor"`
 }
 
+// Health reports the status of a parser after collection.
+type Health struct {
+	Parser   string `json:"parser"`
+	Status   string `json:"status"`    // "ok", "degraded", "error", "not_installed"
+	Records  int    `json:"records"`
+	Error    string `json:"error,omitempty"`
+	DataPath string `json:"data_path,omitempty"`
+}
+
 // Parser collects AI conversation records from a local tool.
 type Parser interface {
 	Name() string
 	SetLookback(hours int) // limit to sessions modified within N hours
 	Collect(state map[string]any) ([]Record, map[string]any, error)
+	DataDir() string // returns the path this parser reads from
 }
 
 // AccountIdentity holds the AI account info extracted from local tool data.

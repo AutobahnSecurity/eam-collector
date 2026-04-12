@@ -35,7 +35,8 @@ func NewContinueParser() *ContinueParser {
 	}
 }
 
-func (p *ContinueParser) Name() string { return "continuedev" }
+func (p *ContinueParser) Name() string    { return "continuedev" }
+func (p *ContinueParser) DataDir() string  { return p.baseDir }
 
 func (p *ContinueParser) Collect(prevState map[string]any) ([]Record, map[string]any, error) {
 	newState := make(map[string]any)

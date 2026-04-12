@@ -18,6 +18,7 @@ type Payload struct {
 	UserEmail  string                    `json:"user_email,omitempty"`
 	Records    []parsers.Record          `json:"records"`
 	Identities []parsers.AccountIdentity `json:"identities,omitempty"`
+	Healths    []parsers.Health          `json:"healths,omitempty"`
 }
 
 // Response from the EAM ingest API

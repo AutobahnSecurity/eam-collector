@@ -39,7 +39,8 @@ func NewCopilotParser() *CopilotParser {
 	}
 }
 
-func (p *CopilotParser) Name() string { return "copilot" }
+func (p *CopilotParser) Name() string    { return "copilot" }
+func (p *CopilotParser) DataDir() string  { return p.baseDir }
 
 func (p *CopilotParser) Collect(prevState map[string]any) ([]Record, map[string]any, error) {
 	newState := make(map[string]any)

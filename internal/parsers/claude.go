@@ -42,7 +42,8 @@ func NewClaudeParser() *ClaudeParser {
 	}
 }
 
-func (p *ClaudeParser) Name() string { return "claude_code" }
+func (p *ClaudeParser) Name() string    { return "claude_code" }
+func (p *ClaudeParser) DataDir() string  { return p.baseDir }
 
 func (p *ClaudeParser) SetLookback(hours int) {
 	p.lookback = time.Duration(hours) * time.Hour
