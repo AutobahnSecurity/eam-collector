@@ -19,9 +19,21 @@ import (
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
 
+// Set via ldflags at build time
+var (
+	version = "dev"
+	build   = "unknown"
+)
+
 func main() {
 	configPath := flag.String("config", "", "Path to config.yaml")
+	showVersion := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("eam-collector %s (build %s)\n", version, build)
+		os.Exit(0)
+	}
 
 	// Find config file
 	cfgPath := *configPath
@@ -123,32 +135,56 @@ func main() {
 
 func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID string, identities []parsers.AccountIdentity) {
 	var allRecords []parsers.Record
+	var healths []parsers.Health
 
 	for _, p := range pp {
 		prevState := store.Get(p.Name())
 		records, newState, err := p.Collect(prevState)
-		if err != nil {
-			log.Printf("[%s] Error: %v", p.Name(), err)
-			continue
+
+		h := parsers.Health{
+			Parser:   p.Name(),
+			DataPath: p.DataDir(),
+			Records:  len(records),
 		}
-		if len(records) > 0 {
+
+		if err != nil {
+			h.Status = "error"
+			h.Error = err.Error()
+			log.Printf("[%s] Error: %v", p.Name(), err)
+		} else if _, statErr := os.Stat(p.DataDir()); os.IsNotExist(statErr) {
+			h.Status = "not_installed"
+		} else if len(records) == 0 {
+			h.Status = "ok"
+		} else {
+			h.Status = "ok"
 			log.Printf("[%s] Collected %d records", p.Name(), len(records))
 			allRecords = append(allRecords, records...)
 		}
-		store.Set(p.Name(), newState)
+
+		healths = append(healths, h)
+		if err == nil {
+			store.Set(p.Name(), newState)
+		}
+	}
+
+	// Log health warnings
+	for _, h := range healths {
+		if h.Status == "error" || h.Status == "degraded" {
+			log.Printf("[health] %s: %s — %s", h.Parser, h.Status, h.Error)
+		}
 	}
 
 	if len(allRecords) == 0 {
 		return
 	}
 
-	// Send to EAM server — no user_email, resolved from MDE on server side
 	ids := make([]parsers.AccountIdentity, len(identities))
 	copy(ids, identities)
 	payload := sender.Payload{
 		DeviceID:   deviceID,
 		Records:    allRecords,
 		Identities: ids,
+		Healths:    healths,
 	}
 
 	resp, err := s.Send(payload)
