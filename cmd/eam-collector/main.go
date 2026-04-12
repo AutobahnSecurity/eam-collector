@@ -95,16 +95,6 @@ func main() {
 	deviceID := hostname()
 	log.Printf("[device] %s", deviceID)
 
-	// Detect AI account identities (from statsig cache + Desktop session paths)
-	identities := parsers.ReadClaudeIdentities()
-	if len(identities) > 0 {
-		for _, id := range identities {
-			log.Printf("[identity] %s account=%s org=%s", id.Tool, id.AccountUUID, id.OrganizationUUID)
-		}
-	} else {
-		log.Println("[identity] No Claude accounts detected")
-	}
-
 	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -118,12 +108,12 @@ func main() {
 	defer ticker.Stop()
 
 	// Run immediately on startup
-	collect(activeParsers, s, stateStore, deviceID, identities)
+	collect(activeParsers, s, stateStore, deviceID)
 
 	for {
 		select {
 		case <-ticker.C:
-			collect(activeParsers, s, stateStore, deviceID, identities)
+			collect(activeParsers, s, stateStore, deviceID)
 		case sig := <-sigCh:
 			log.Printf("Received %s, shutting down", sig)
 			_ = stateStore.Save()
@@ -133,7 +123,7 @@ func main() {
 	}
 }
 
-func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID string, identities []parsers.AccountIdentity) {
+func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID string) {
 	var allRecords []parsers.Record
 	var healths []parsers.Health
 
@@ -178,34 +168,133 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		return
 	}
 
-	ids := make([]parsers.AccountIdentity, len(identities))
-	copy(ids, identities)
-	payload := sender.Payload{
-		DeviceID:   deviceID,
-		Records:    allRecords,
-		Identities: ids,
-		Healths:    healths,
+	// Per-session identity: snapshot the current account when a session is
+	// first seen. This ensures governance is determined by the account active
+	// at session creation, not the current account (which may have changed).
+	currentIdentity := parsers.ReadClaudeIdentity()
+	sessionIDs := loadSessionIdentities(store)
+
+	// Track sessions in this batch for state cleanup
+	activeSessions := make(map[string]bool)
+	for _, r := range allRecords {
+		activeSessions[r.SessionID] = true
+		if _, exists := sessionIDs[r.SessionID]; !exists && currentIdentity != nil {
+			sessionIDs[r.SessionID] = *currentIdentity
+		}
 	}
 
-	resp, err := s.Send(payload)
-	if err != nil {
-		log.Printf("[sender] Failed: %v", err)
-		return
+	// Remove sessions no longer in the lookback window
+	for sid := range sessionIDs {
+		if !activeSessions[sid] {
+			delete(sessionIDs, sid)
+		}
+	}
+	saveSessionIdentities(store, sessionIDs)
+
+	// Group records by org UUID so each batch carries the correct identity
+	type batch struct {
+		identity []parsers.AccountIdentity
+		records  []parsers.Record
+	}
+	groups := make(map[string]*batch)
+	for _, r := range allRecords {
+		orgKey := ""
+		var id *parsers.AccountIdentity
+		if stored, ok := sessionIDs[r.SessionID]; ok {
+			orgKey = stored.OrganizationUUID
+			id = &stored
+		}
+		b := groups[orgKey]
+		if b == nil {
+			b = &batch{}
+			if id != nil {
+				b.identity = []parsers.AccountIdentity{*id}
+			}
+			groups[orgKey] = b
+		}
+		b.records = append(b.records, r)
 	}
 
-	log.Printf("[sender] Stored %d usage records, %d prompts (%d flagged)",
-		resp.Stored, resp.Prompts, resp.Flagged)
-
-	// Save state only after successful send
-	if err := store.Save(); err != nil {
-		log.Printf("[state] Failed to save: %v", err)
+	// Send separate payloads per identity group
+	allOK := true
+	for _, b := range groups {
+		for _, id := range b.identity {
+			log.Printf("[identity] %s account=%s org=%s (%d records)",
+				id.Tool, id.AccountUUID, id.OrganizationUUID, len(b.records))
+		}
+		payload := sender.Payload{
+			DeviceID:   deviceID,
+			Records:    b.records,
+			Identities: b.identity,
+			Healths:    healths,
+		}
+		resp, err := s.Send(payload)
+		if err != nil {
+			log.Printf("[sender] Failed: %v", err)
+			allOK = false
+			continue
+		}
+		log.Printf("[sender] Stored %d usage records, %d prompts (%d flagged)",
+			resp.Stored, resp.Prompts, resp.Flagged)
 	}
+
+	// Save state only after all sends succeed
+	if allOK {
+		if err := store.Save(); err != nil {
+			log.Printf("[state] Failed to save: %v", err)
+		}
+	}
+}
+
+// loadSessionIdentities restores the session→identity map from state.
+func loadSessionIdentities(store *state.Store) map[string]parsers.AccountIdentity {
+	result := make(map[string]parsers.AccountIdentity)
+	raw, ok := store.Get("_identities")["sessions"]
+	if !ok {
+		return result
+	}
+	m, ok := raw.(map[string]any)
+	if !ok {
+		return result
+	}
+	for sid, v := range m {
+		idMap, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		acct, _ := idMap["account_uuid"].(string)
+		org, _ := idMap["organization_uuid"].(string)
+		tool, _ := idMap["tool"].(string)
+		if acct != "" {
+			result[sid] = parsers.AccountIdentity{
+				AccountUUID:      acct,
+				OrganizationUUID: org,
+				Tool:             tool,
+			}
+		}
+	}
+	return result
+}
+
+// saveSessionIdentities persists the session→identity map to state.
+func saveSessionIdentities(store *state.Store, identities map[string]parsers.AccountIdentity) {
+	m := make(map[string]any, len(identities))
+	for sid, id := range identities {
+		m[sid] = map[string]any{
+			"account_uuid":      id.AccountUUID,
+			"organization_uuid": id.OrganizationUUID,
+			"tool":              id.Tool,
+		}
+	}
+	store.Set("_identities", map[string]any{"sessions": m})
 }
 
 func createParser(name string) parsers.Parser {
 	switch name {
 	case "claude_code":
 		return parsers.NewClaudeParser()
+	case "claude_desktop":
+		return parsers.NewClaudeDesktopParser()
 	case "cursor":
 		return parsers.NewCursorParser()
 	case "copilot":
@@ -235,14 +324,18 @@ func homeDir() string {
 	return h
 }
 
+// hostnameSuffixes must match normalizeHostname() in classification.ts on the server.
+var hostnameSuffixes = []string{".local", ".lan", ".home", ".internal"}
+
 func hostname() string {
 	h, err := os.Hostname()
 	if err != nil {
 		return "unknown"
 	}
-	// Normalize: lowercase, strip .local suffix to match MDE device names
 	h = strings.ToLower(h)
-	h = strings.TrimSuffix(h, ".local")
+	for _, suffix := range hostnameSuffixes {
+		h = strings.TrimSuffix(h, suffix)
+	}
 	return h
 }
 

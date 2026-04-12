@@ -148,13 +148,20 @@ func (p *ClaudeParser) parseFile(path string, offset int64) ([]Record, int64, er
 			sessionID = filepath.Base(strings.TrimSuffix(path, ".jsonl"))
 		}
 
+		// Claude Code uses "<synthetic>" for tool-result/system messages
+		// that aren't real LLM calls. Filter to avoid polluting model data.
+		model := cl.Message.Model
+		if model == "<synthetic>" {
+			model = ""
+		}
+
 		records = append(records, Record{
 			Source:       "claude-code",
 			SessionID:    fmt.Sprintf("collector:claude:%s", sessionID),
 			Timestamp:    ts,
 			Role:         cl.Message.Role,
 			Content:      content,
-			Model:        cl.Message.Model,
+			Model:        model,
 			InputTokens:  cl.Message.Usage.InputTokens,
 			OutputTokens: cl.Message.Usage.OutputTokens,
 			AIVendor:     "Anthropic",
