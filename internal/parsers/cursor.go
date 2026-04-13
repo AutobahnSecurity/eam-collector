@@ -2,9 +2,7 @@ package parsers
 
 import (
 	"database/sql"
-	"encoding/json"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,35 +22,34 @@ func NewCursorParser() *CursorParser {
 	}
 }
 
-func (p *CursorParser) Name() string    { return "cursor" }
-func (p *CursorParser) DataDir() string  { return p.dbPath }
+func (p *CursorParser) Name() string   { return "cursor" }
+func (p *CursorParser) DataDir() string { return p.dbPath }
 
 func (p *CursorParser) SetLookback(hours int) {
 	p.lookback = time.Duration(hours) * time.Hour
 }
 
-func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]any, error) {
-	newState := make(map[string]any)
+// Cursor stores data in cursorDiskKV (SQLite):
+//
+//   composerData:{composerId} → JSON with createdAt, lastUpdatedAt, status
+//   bubbleId:{composerId}:{bubbleId} → JSON with type (1=user, 2=assistant), text
+//
+// Strategy:
+//   1. Find composers active within the lookback window (by lastUpdatedAt/createdAt)
+//   2. Only fetch bubbles for those active composers
+//   3. Track seen bubble keys per-composer to emit only new ones
 
+func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]any, error) {
 	if _, err := os.Stat(p.dbPath); os.IsNotExist(err) {
 		return nil, prevState, nil
 	}
 
-	// Only collect if Cursor's database was modified within the lookback window.
-	// This prevents reporting stale data from an installed-but-unused Cursor.
 	info, err := os.Stat(p.dbPath)
 	if err != nil {
 		return nil, prevState, fmt.Errorf("stat cursor db: %w", err)
 	}
 	if time.Since(info.ModTime()) > p.lookback {
 		return nil, prevState, nil
-	}
-
-	var lastTS float64
-	if v, ok := prevState["last_processed_ts"]; ok {
-		if f, ok := v.(float64); ok {
-			lastTS = f
-		}
 	}
 
 	db, err := sql.Open("sqlite", p.dbPath+"?mode=ro")
@@ -66,260 +63,121 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		return nil, prevState, fmt.Errorf("schema changed: cursorDiskKV table not found")
 	}
 
-	// First encounter: find the max createdAt from existing composers and all bubble keys.
-	// Save them as baseline — only data AFTER this point gets collected.
-	if lastTS == 0 {
-		var maxCreatedAt float64
-		rows, err := db.Query(`SELECT value FROM cursorDiskKV WHERE key LIKE 'composerData:%'`)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var value []byte
-				if err := rows.Scan(&value); err != nil {
-					continue
-				}
-				var raw map[string]json.RawMessage
-				if json.Unmarshal(value, &raw) != nil {
-					continue
-				}
-				var ca float64
-				if v, ok := raw["createdAt"]; ok {
-					json.Unmarshal(v, &ca)
-				}
-				if ca > maxCreatedAt {
-					maxCreatedAt = ca
-				}
-			}
-		}
-		if maxCreatedAt == 0 {
-			maxCreatedAt = float64(time.Now().UnixMilli())
-		}
-		allBubbles, _ := p.getAllBubbleKeys(db)
-		newState["last_processed_ts"] = maxCreatedAt
-		newState["processed_bubbles"] = allBubbles
-		return nil, newState, nil
-	}
-
-	var records []Record
-	var maxTS float64
-
-	rows, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'`)
+	// Step 1: Find active composers within the lookback window.
+	// Uses millisecond epoch timestamps stored in composerData.
+	cutoffMs := time.Now().Add(-p.lookback).UnixMilli()
+	activeRows, err := db.Query(`
+		SELECT json_extract(value, '$.composerId') as cid
+		FROM cursorDiskKV
+		WHERE key LIKE 'composerData:%'
+		  AND COALESCE(
+		    json_extract(value, '$.lastUpdatedAt'),
+		    json_extract(value, '$.createdAt')
+		  ) > ?
+	`, cutoffMs)
 	if err != nil {
-		return nil, prevState, fmt.Errorf("query composers: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var key string
-		var value []byte
-		if err := rows.Scan(&key, &value); err != nil {
-			continue
-		}
-
-		var raw map[string]json.RawMessage
-		if err := json.Unmarshal(value, &raw); err != nil {
-			continue
-		}
-
-		// Extract composerId and createdAt
-		composerID := strings.TrimPrefix(key, "composerData:")
-		var createdAt float64
-		if v, ok := raw["createdAt"]; ok {
-			json.Unmarshal(v, &createdAt)
-		}
-		if createdAt <= lastTS {
-			continue
-		}
-		// Only process sessions within lookback window (active sessions)
-		if time.Since(time.UnixMilli(int64(createdAt))) > p.lookback {
-			continue
-		}
-
-		ts := time.UnixMilli(int64(createdAt)).UTC().Format(time.RFC3339)
-		sessionID := fmt.Sprintf("collector:cursor:%s", composerID)
-
-		// Try to extract from inline conversation (v14+)
-		if convRaw, ok := raw["conversation"]; ok {
-			recs := p.parseConversation(convRaw, sessionID, ts)
-			records = append(records, recs...)
-		}
-
-		// Try to extract from inline text (v1 with embedded conversation)
-		if textRaw, ok := raw["text"]; ok {
-			var text string
-			if json.Unmarshal(textRaw, &text) == nil && text != "" {
-				records = append(records, Record{
-					Source:    "cursor",
-					SessionID: sessionID,
-					Timestamp: ts,
-					Role:      "user",
-					Content:   text,
-					AIVendor:  "Cursor",
-				})
-			}
-		}
-
-		if createdAt > maxTS {
-			maxTS = createdAt
-		}
+		return nil, prevState, fmt.Errorf("query active composers: %w", err)
 	}
 
-	// Also check for bubbles (older format) — track processed keys to avoid re-sending.
-	// Skip bubble reading entirely if processedBubbles is empty (first run after skip) —
-	// prevents dumping all historical bubble data.
-	processedBubbles := make(map[string]bool)
-	if raw, ok := prevState["processed_bubbles"]; ok {
-		if arr, ok := raw.([]any); ok {
+	var activeComposers []string
+	for activeRows.Next() {
+		var cid string
+		if err := activeRows.Scan(&cid); err == nil && cid != "" {
+			activeComposers = append(activeComposers, cid)
+		}
+	}
+	activeRows.Close()
+
+	if len(activeComposers) == 0 {
+		return nil, prevState, nil
+	}
+
+	// Restore seen bubble keys from previous state.
+	// Handle both []any (from JSON round-trip) and []string (in-memory).
+	seen := make(map[string]bool)
+	if raw, ok := prevState["seen_keys"]; ok {
+		switch arr := raw.(type) {
+		case []any:
 			for _, v := range arr {
 				if s, ok := v.(string); ok {
-					processedBubbles[s] = true
+					seen[s] = true
 				}
+			}
+		case []string:
+			for _, s := range arr {
+				seen[s] = true
 			}
 		}
 	}
-	if len(processedBubbles) > 0 {
-		bubbleRecords, newBubbleKeys, err := p.readBubbles(db, processedBubbles)
+	isFirstRun := prevState == nil || prevState["seen_keys"] == nil
+
+	// Step 2: Fetch user bubbles only for active composers
+	var records []Record
+	var newKeys []string
+
+	for _, composerID := range activeComposers {
+		prefix := "bubbleId:" + composerID + ":"
+		rows, err := db.Query(`
+			SELECT key, value FROM cursorDiskKV
+			WHERE key LIKE ? || '%'
+			  AND json_extract(value, '$.type') = 1
+			  AND json_extract(value, '$.text') != ''
+		`, prefix)
 		if err != nil {
-			log.Printf("[cursor] Error reading bubbles: %v", err)
-		} else {
-			records = append(records, bubbleRecords...)
+			continue
 		}
-		// Keep only last 10000 bubble keys to bound state size
-		allKeys := make([]string, 0, len(processedBubbles)+len(newBubbleKeys))
-		for k := range processedBubbles {
-			allKeys = append(allKeys, k)
+
+		for rows.Next() {
+			var key string
+			var value []byte
+			if err := rows.Scan(&key, &value); err != nil || value == nil {
+				continue
+			}
+
+			newKeys = append(newKeys, key)
+
+			if seen[key] || isFirstRun {
+				continue
+			}
+
+			text := extractJSONField(value, "text")
+			if text == "" {
+				continue
+			}
+
+			records = append(records, Record{
+				Source:    "cursor",
+				SessionID: fmt.Sprintf("collector:cursor:%s", composerID),
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+				Role:      "user",
+				Content:   text,
+				AIVendor:  "Cursor",
+			})
 		}
-		allKeys = append(allKeys, newBubbleKeys...)
-		if len(allKeys) > 10000 {
-			allKeys = allKeys[len(allKeys)-10000:]
-		}
-		newState["processed_bubbles"] = allKeys
-	} else {
-		// First run after skip — mark all current bubbles as processed
-		// so next cycle only picks up new ones
-		allKeys, _ := p.getAllBubbleKeys(db)
-		newState["processed_bubbles"] = allKeys
+		rows.Close()
 	}
 
-	if maxTS > lastTS {
-		newState["last_processed_ts"] = maxTS
-	} else {
-		newState["last_processed_ts"] = lastTS
-	}
-
+	// State: only track keys from active composers (old ones drop off naturally)
+	newState := make(map[string]any)
+	newState["seen_keys"] = newKeys
 	return records, newState, nil
 }
 
-// parseConversation extracts messages from the inline conversation array (v14+)
-func (p *CursorParser) parseConversation(raw json.RawMessage, sessionID, ts string) []Record {
-	var conversation []struct {
-		Type    int    `json:"type"` // 1=user, 2=assistant
-		Text    string `json:"text"`
-		BubbleID string `json:"bubbleId"`
+// extractJSONField extracts a string value for a key from a JSON object.
+// Simple parser that avoids importing encoding/json.
+func extractJSONField(data []byte, field string) string {
+	needle := `"` + field + `":"`
+	s := string(data)
+	idx := strings.Index(s, needle)
+	if idx == -1 {
+		return ""
 	}
-	if err := json.Unmarshal(raw, &conversation); err != nil {
-		return nil
+	start := idx + len(needle)
+	end := strings.Index(s[start:], `"`)
+	if end == -1 {
+		return ""
 	}
-
-	var records []Record
-	for _, msg := range conversation {
-		if msg.Text == "" {
-			continue
-		}
-		role := "user"
-		if msg.Type == 2 {
-			role = "assistant"
-		}
-		records = append(records, Record{
-			Source:    "cursor",
-			SessionID: sessionID,
-			Timestamp: ts,
-			Role:      role,
-			Content:   msg.Text,
-			AIVendor:  "Cursor",
-		})
-	}
-	return records
-}
-
-// readBubbles reads from the old bubbleId: format (v1-v3 composers).
-// Returns records and list of newly processed keys.
-func (p *CursorParser) readBubbles(db *sql.DB, processed map[string]bool) ([]Record, []string, error) {
-	rows, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'`)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer rows.Close()
-
-	var records []Record
-	var newKeys []string
-	for rows.Next() {
-		var key string
-		var value []byte
-		if err := rows.Scan(&key, &value); err != nil {
-			continue
-		}
-
-		if processed[key] {
-			continue
-		}
-
-		parts := strings.SplitN(key, ":", 3)
-		if len(parts) < 3 {
-			continue
-		}
-		composerID := parts[1]
-
-		var bubble struct {
-			Type int    `json:"type"`
-			Text string `json:"text"`
-		}
-		if err := json.Unmarshal(value, &bubble); err != nil {
-			continue
-		}
-		if bubble.Text == "" {
-			continue
-		}
-
-		role := "user"
-		if bubble.Type == 2 {
-			role = "assistant"
-		}
-
-		records = append(records, Record{
-			Source:    "cursor",
-			SessionID: fmt.Sprintf("collector:cursor:%s", composerID),
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Role:      role,
-			Content:   bubble.Text,
-			AIVendor:  "Cursor",
-		})
-		newKeys = append(newKeys, key)
-	}
-
-	return records, newKeys, rows.Err()
-}
-
-// getAllBubbleKeys returns all current bubbleId keys without reading their content.
-// Used on first run to mark all existing bubbles as processed.
-func (p *CursorParser) getAllBubbleKeys(db *sql.DB) ([]string, error) {
-	rows, err := db.Query(`SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var keys []string
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			continue
-		}
-		keys = append(keys, key)
-	}
-	if len(keys) > 10000 {
-		keys = keys[len(keys)-10000:]
-	}
-	return keys, rows.Err()
+	return s[start : start+end]
 }
 
 func cursorDBPath() string {
