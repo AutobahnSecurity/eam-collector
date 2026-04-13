@@ -335,6 +335,10 @@ func createParser(name string) parsers.Parser {
 		return parsers.NewCopilotParser()
 	case "continuedev":
 		return parsers.NewContinueParser()
+	case "opencode":
+		return parsers.NewOpenCodeParser()
+	case "codex":
+		return parsers.NewCodexParser()
 	default:
 		return nil
 	}

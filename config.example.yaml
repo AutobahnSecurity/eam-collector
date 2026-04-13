@@ -12,9 +12,15 @@ lookback: 24
 parsers:
   claude_code:
     enabled: true
+  claude_desktop:
+    enabled: true
   cursor:
     enabled: true
   copilot:
     enabled: true
   continuedev:
+    enabled: true
+  opencode:
+    enabled: true
+  codex:
     enabled: true
