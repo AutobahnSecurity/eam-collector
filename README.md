@@ -9,24 +9,31 @@ Runs as a background daemon (launchd on macOS, systemd on Linux). Single binary,
 | Tool | Parser | Local Data |
 |------|--------|-----------|
 | Claude Code | `claude_code` | JSONL session files (`~/.claude/projects/`) |
+| Claude Desktop | `claude_desktop` | IndexedDB LevelDB log |
 | Cursor | `cursor` | SQLite database (`state.vscdb`) |
 | GitHub Copilot | `copilot` | JSON chat sessions |
 | Continue.dev | `continuedev` | JSON session files |
 
 ## Quick Start
 
-### 1. Build
+### 1. Install via Homebrew
 
 ```bash
-make build          # current platform
-make build-all      # all platforms (macOS arm64/amd64, Linux amd64, Windows)
+brew tap AutobahnSecurity/tap
+brew install eam-collector
 ```
+
+This installs the binary, creates a config template at `~/.eam-collector/config.yaml`, and registers a background service.
 
 ### 2. Configure
 
 ```bash
-mkdir -p ~/.eam-collector
-cat > ~/.eam-collector/config.yaml <<EOF
+nano ~/.eam-collector/config.yaml
+```
+
+Set your EAM server URL and API key:
+
+```yaml
 server:
   url: https://eam.your-company.com
   api_key: ek_your-ingest-key
@@ -37,37 +44,44 @@ lookback: 24
 parsers:
   claude_code:
     enabled: true
+  claude_desktop:
+    enabled: true
   cursor:
     enabled: true
   copilot:
     enabled: true
   continuedev:
     enabled: true
-EOF
 ```
 
-### 3. Install as daemon
+### 3. Start
 
 ```bash
+brew services start eam-collector
+```
+
+### 4. Verify
+
+```bash
+# Check logs
+tail -f /opt/homebrew/var/log/eam-collector.log
+
+# Check if running
+pgrep -f eam-collector
+```
+
+## Manual Install (without Homebrew)
+
+For Linux or environments without Homebrew, download the binary from [Releases](https://github.com/AutobahnSecurity/eam-collector/releases) and use the install script:
+
+```bash
+tar xzf eam-collector-*-linux-amd64.tar.gz
 sudo ./install/install.sh
 ```
 
 This installs the binary to `/usr/local/bin/eam-collector` and sets up:
 - **macOS**: LaunchAgent (`~/Library/LaunchAgents/com.eam.collector.plist`)
 - **Linux**: systemd service (`/etc/systemd/system/eam-collector.service`)
-
-### 4. Verify
-
-```bash
-# Check if running
-pgrep -f eam-collector
-
-# Check logs
-# macOS:
-cat /tmp/eam-collector.log
-# Linux:
-journalctl -u eam-collector -f
-```
 
 ## Configuration
 
@@ -85,33 +99,42 @@ Environment variables are expanded in config values (e.g., `api_key: ${EAM_API_K
 
 1. **Poll** enabled parsers every `interval` seconds
 2. **Read** new/changed session data from local tool files
-3. **Detect** Claude account identity (org UUID from statsig cache + Desktop session paths)
+3. **Detect** Claude account identity (org UUID from statsig cache)
 4. **Send** records to EAM server `POST /api/ingest` with device ID + identities
 5. **Save** state (file offsets, timestamps) only after successful send
 
 ### Lookback Filter
 
-The `lookback` setting limits which files are processed. Only sessions modified within the lookback window are read. Set to `2` for "active sessions only" mode — no historical backlog on first run.
+The `lookback` setting limits which files are processed. Only sessions modified within the lookback window are read. Set to `2` for "active sessions only" mode -- no historical backlog on first run.
 
 ### Identity Detection
 
-The collector extracts Claude organization UUIDs from two sources:
-- Statsig cache: `~/.claude/statsig/statsig.cached.evaluations*`
-- Desktop session paths: `~/Library/Application Support/Claude/local-agent-mode-sessions/{account}/{org}/`
+The collector extracts Claude organization UUIDs from the statsig cache (`~/.claude/statsig/statsig.cached.evaluations*`). This reflects the currently logged-in account only.
 
 These are sent as `identities[]` in the ingest payload. The EAM server checks if any org UUID matches `GOVERNED_ORG_IDS` to determine governance.
 
 ### State Persistence
 
-State is saved to `~/.eam-collector/state.json` (mode 600) **only after successful send**. If the server is unreachable, state is not updated — records will be re-sent on the next cycle.
+State is saved to `~/.eam-collector/state.json` (mode 600) **only after successful send**. If the server is unreachable, state is not updated -- records will be re-sent on the next cycle.
 
 Per-parser state:
-- **Claude**: byte offsets per JSONL file
-- **Cursor**: last processed `createdAt` timestamp
+- **Claude Code**: byte offsets per JSONL file
+- **Claude Desktop**: log offset + last timestamp
+- **Cursor**: last processed `createdAt` timestamp + processed bubble keys
 - **Copilot**: file modification times
 - **Continue.dev**: set of processed session IDs
 
 ## Uninstall
+
+### Homebrew
+
+```bash
+brew services stop eam-collector
+brew uninstall eam-collector
+rm -rf ~/.eam-collector
+```
+
+### Manual
 
 ```bash
 # macOS
@@ -131,10 +154,22 @@ rm -rf ~/.eam-collector
 ## Development
 
 ```bash
-go build -o dist/eam-collector ./cmd/eam-collector/   # build
-go test ./...                                           # test
+make build                                              # build for current platform
+make build-all                                          # all platforms
+make test                                               # run tests
 ./dist/eam-collector -config config.example.yaml        # run locally
 ```
+
+### Releasing
+
+Tag a version to trigger a release via GoReleaser:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+This builds binaries, creates a GitHub Release, and pushes the Homebrew formula to [AutobahnSecurity/homebrew-tap](https://github.com/AutobahnSecurity/homebrew-tap).
 
 ## License
 
