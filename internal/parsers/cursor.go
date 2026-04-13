@@ -143,7 +143,9 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		}
 	}
 
-	// Also check for bubbles (older format) — track processed keys to avoid re-sending
+	// Also check for bubbles (older format) — track processed keys to avoid re-sending.
+	// Skip bubble reading entirely if processedBubbles is empty (first run after skip) —
+	// prevents dumping all historical bubble data.
 	processedBubbles := make(map[string]bool)
 	if raw, ok := prevState["processed_bubbles"]; ok {
 		if arr, ok := raw.([]any); ok {
@@ -154,22 +156,29 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 			}
 		}
 	}
-	bubbleRecords, newBubbleKeys, err := p.readBubbles(db, processedBubbles)
-	if err != nil {
-		log.Printf("[cursor] Error reading bubbles: %v", err)
+	if len(processedBubbles) > 0 {
+		bubbleRecords, newBubbleKeys, err := p.readBubbles(db, processedBubbles)
+		if err != nil {
+			log.Printf("[cursor] Error reading bubbles: %v", err)
+		} else {
+			records = append(records, bubbleRecords...)
+		}
+		// Keep only last 10000 bubble keys to bound state size
+		allKeys := make([]string, 0, len(processedBubbles)+len(newBubbleKeys))
+		for k := range processedBubbles {
+			allKeys = append(allKeys, k)
+		}
+		allKeys = append(allKeys, newBubbleKeys...)
+		if len(allKeys) > 10000 {
+			allKeys = allKeys[len(allKeys)-10000:]
+		}
+		newState["processed_bubbles"] = allKeys
 	} else {
-		records = append(records, bubbleRecords...)
+		// First run after skip — mark all current bubbles as processed
+		// so next cycle only picks up new ones
+		allKeys, _ := p.getAllBubbleKeys(db)
+		newState["processed_bubbles"] = allKeys
 	}
-	// Keep only last 10000 bubble keys to bound state size
-	allKeys := make([]string, 0, len(processedBubbles)+len(newBubbleKeys))
-	for k := range processedBubbles {
-		allKeys = append(allKeys, k)
-	}
-	allKeys = append(allKeys, newBubbleKeys...)
-	if len(allKeys) > 10000 {
-		allKeys = allKeys[len(allKeys)-10000:]
-	}
-	newState["processed_bubbles"] = allKeys
 
 	if maxTS > lastTS {
 		newState["last_processed_ts"] = maxTS
@@ -268,6 +277,28 @@ func (p *CursorParser) readBubbles(db *sql.DB, processed map[string]bool) ([]Rec
 	}
 
 	return records, newKeys, rows.Err()
+}
+
+// getAllBubbleKeys returns all current bubbleId keys without reading their content.
+// Used on first run to mark all existing bubbles as processed.
+func (p *CursorParser) getAllBubbleKeys(db *sql.DB) ([]string, error) {
+	rows, err := db.Query(`SELECT key FROM cursorDiskKV WHERE key LIKE 'bubbleId:%'`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	if len(keys) > 10000 {
+		keys = keys[len(keys)-10000:]
+	}
+	return keys, rows.Err()
 }
 
 func cursorDBPath() string {
