@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"log"
@@ -28,10 +29,16 @@ var (
 func main() {
 	configPath := flag.String("config", "", "Path to config.yaml")
 	showVersion := flag.Bool("version", false, "Print version and exit")
+	runSetup := flag.Bool("setup", false, "Interactive setup wizard")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("eam-collector %s (build %s)\n", version, build)
+		os.Exit(0)
+	}
+
+	if *runSetup {
+		setupWizard()
 		os.Exit(0)
 	}
 
@@ -41,7 +48,19 @@ func main() {
 		cfgPath = findConfig()
 	}
 	if cfgPath == "" {
-		log.Fatal("No config file found. Use -config flag or create ~/.eam-collector/config.yaml")
+		// Auto-run setup if stdin is a terminal
+		if isTerminal() {
+			fmt.Println("No config file found. Running setup wizard...")
+			fmt.Println()
+			setupWizard()
+			// Reload config after setup
+			cfgPath = findConfig()
+			if cfgPath == "" {
+				log.Fatal("Setup did not create a config file")
+			}
+		} else {
+			log.Fatal("No config file found. Run: eam-collector --setup")
+		}
 	}
 
 	cfg, err := config.Load(cfgPath)
@@ -179,9 +198,14 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		}
 	}
 
-	// Always log a heartbeat so it's clear the collector is alive
+	// Send heartbeat to server so it knows we're alive, even with no data
 	if len(allRecords) == 0 {
-		log.Println("[heartbeat] No new records")
+		if err := s.Heartbeat(deviceID); err != nil {
+			log.Printf("[heartbeat] Failed: %v", err)
+		} else {
+			log.Println("[heartbeat] OK")
+		}
+		return
 	}
 
 	// Log health warnings
@@ -411,5 +435,89 @@ func hostname() string {
 		h = strings.TrimSuffix(h, suffix)
 	}
 	return h
+}
+
+func isTerminal() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+func setupWizard() {
+	scanner := bufio.NewScanner(os.Stdin)
+
+	fmt.Println("══════════════════════════════════════════")
+	fmt.Println("  EAM Collector Setup")
+	fmt.Println("══════════════════════════════════════════")
+	fmt.Println()
+
+	// Server URL
+	fmt.Print("Server URL [https://eam.devops.atbhn.io]: ")
+	scanner.Scan()
+	serverURL := strings.TrimSpace(scanner.Text())
+	if serverURL == "" {
+		serverURL = "https://eam.devops.atbhn.io"
+	}
+
+	// API Key
+	fmt.Print("API Key (ek_...): ")
+	scanner.Scan()
+	apiKey := strings.TrimSpace(scanner.Text())
+	if apiKey == "" || !strings.HasPrefix(apiKey, "ek_") {
+		log.Fatal("API key is required and must start with ek_")
+	}
+
+	// Test connection
+	fmt.Print("Testing connection... ")
+	s := sender.New(serverURL, apiKey)
+	if err := s.Ping(); err != nil {
+		fmt.Println("FAILED")
+		log.Fatalf("Cannot reach server: %v", err)
+	}
+	fmt.Println("OK")
+
+	// Write config
+	configDir := filepath.Join(homeDir(), ".eam-collector")
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		log.Fatalf("Cannot create config directory: %v", err)
+	}
+
+	configContent := fmt.Sprintf(`server:
+  url: %s
+  api_key: %s
+
+interval: 60
+lookback: 24
+
+parsers:
+  claude_code:
+    enabled: true
+  claude_desktop:
+    enabled: true
+  cursor:
+    enabled: true
+  copilot:
+    enabled: true
+  continuedev:
+    enabled: true
+  opencode:
+    enabled: true
+  codex:
+    enabled: true
+`, serverURL, apiKey)
+
+	configPath := filepath.Join(configDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+		log.Fatalf("Cannot write config: %v", err)
+	}
+
+	fmt.Println()
+	fmt.Printf("Config saved to %s\n", configPath)
+	fmt.Println()
+	fmt.Println("Start the collector:")
+	fmt.Println("  brew services start eam-collector")
+	fmt.Println()
 }
 

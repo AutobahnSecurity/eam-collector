@@ -130,7 +130,7 @@ func (s *Sender) sendBatch(payload Payload) (*Response, error) {
 
 // Ping checks if the EAM server is reachable.
 func (s *Sender) Ping() error {
-	req, err := http.NewRequest("POST", s.url, bytes.NewReader([]byte(`{"device_id":"ping","records":[]}`)))
+	req, err := http.NewRequest("POST", s.url, bytes.NewReader([]byte(`{"device_id":"ping","records":[],"heartbeat":true}`)))
 	if err != nil {
 		return err
 	}
@@ -146,5 +146,24 @@ func (s *Sender) Ping() error {
 	if resp.StatusCode == 401 {
 		return fmt.Errorf("invalid API key")
 	}
+	return nil
+}
+
+// Heartbeat sends a lightweight ping to the server so it knows the collector is alive.
+// Called when no new records are available.
+func (s *Sender) Heartbeat(deviceID string) error {
+	body := fmt.Sprintf(`{"device_id":%q,"records":[],"heartbeat":true}`, deviceID)
+	req, err := http.NewRequest("POST", s.url, bytes.NewReader([]byte(body)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-EAM-Key", s.apiKey)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	resp.Body.Close()
 	return nil
 }
