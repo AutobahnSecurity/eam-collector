@@ -163,44 +163,51 @@ func readDesktopIdentity(home string) *AccountIdentity {
 		appDir = filepath.Join(home, ".config", "Claude")
 	}
 
-	sessionsDir := filepath.Join(appDir, "local-agent-mode-sessions")
-	accounts, err := os.ReadDir(sessionsDir)
-	if err != nil {
-		return nil
+	// Check both legacy and current Desktop session directories
+	sessionsDirs := []string{
+		filepath.Join(appDir, "claude-code-sessions"),
+		filepath.Join(appDir, "local-agent-mode-sessions"),
 	}
 
 	var bestAccount, bestOrg string
 	var bestMtime int64
 
-	for _, acctEntry := range accounts {
-		if !acctEntry.IsDir() {
-			continue
-		}
-		acctName := acctEntry.Name()
-		if acctName == "skills-plugin" || !uuidRe.MatchString(acctName) {
-			continue
-		}
-
-		orgs, err := os.ReadDir(filepath.Join(sessionsDir, acctName))
+	for _, sessionsDir := range sessionsDirs {
+		accounts, err := os.ReadDir(sessionsDir)
 		if err != nil {
 			continue
 		}
-		for _, orgEntry := range orgs {
-			if !orgEntry.IsDir() {
+
+		for _, acctEntry := range accounts {
+			if !acctEntry.IsDir() {
 				continue
 			}
-			orgName := orgEntry.Name()
-			if !uuidRe.MatchString(orgName) {
+			acctName := acctEntry.Name()
+			if acctName == "skills-plugin" || !uuidRe.MatchString(acctName) {
 				continue
 			}
-			info, err := orgEntry.Info()
+
+			orgs, err := os.ReadDir(filepath.Join(sessionsDir, acctName))
 			if err != nil {
 				continue
 			}
-			if mt := info.ModTime().UnixNano(); mt > bestMtime {
-				bestMtime = mt
-				bestAccount = acctName
-				bestOrg = orgName
+			for _, orgEntry := range orgs {
+				if !orgEntry.IsDir() {
+					continue
+				}
+				orgName := orgEntry.Name()
+				if !uuidRe.MatchString(orgName) {
+					continue
+				}
+				info, err := orgEntry.Info()
+				if err != nil {
+					continue
+				}
+				if mt := info.ModTime().UnixNano(); mt > bestMtime {
+					bestMtime = mt
+					bestAccount = acctName
+					bestOrg = orgName
+				}
 			}
 		}
 	}

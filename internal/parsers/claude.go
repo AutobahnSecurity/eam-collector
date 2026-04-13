@@ -33,8 +33,9 @@ type ClaudeLine struct {
 }
 
 type ClaudeParser struct {
-	baseDir  string // defaults to ~/.claude/projects/
-	lookback time.Duration
+	baseDir           string // defaults to ~/.claude/projects/
+	lookback          time.Duration
+	desktopSessionIDs map[string]bool // cliSessionIds owned by Desktop (skip in CLI parser)
 }
 
 func NewClaudeParser() *ClaudeParser {
@@ -43,6 +44,12 @@ func NewClaudeParser() *ClaudeParser {
 		baseDir:  filepath.Join(home, ".claude", "projects"),
 		lookback: 24 * time.Hour,
 	}
+}
+
+// SetDesktopSessionIDs sets the cliSessionIds that belong to Desktop code sessions.
+// The Claude Code parser will skip these files to avoid double-counting.
+func (p *ClaudeParser) SetDesktopSessionIDs(ids map[string]bool) {
+	p.desktopSessionIDs = ids
 }
 
 func (p *ClaudeParser) Name() string   { return "claude_code" }
@@ -66,8 +73,14 @@ func (p *ClaudeParser) Collect(prevState map[string]any) ([]Record, map[string]a
 	newOffsets := make(map[string]float64)
 
 	for _, path := range files {
-		prevOffset := int64(offsets[path])
 		sessionID := filepath.Base(strings.TrimSuffix(path, ".jsonl"))
+
+		// Skip JSONL files that belong to Desktop code sessions
+		if p.desktopSessionIDs[sessionID] {
+			continue
+		}
+
+		prevOffset := int64(offsets[path])
 		recs, newOffset, err := ParseClaudeJSONLFile(path, prevOffset, "claude-code", "collector:claude:"+sessionID, "Anthropic")
 		if err != nil {
 			log.Printf("[claude] Error parsing %s: %v", path, err)

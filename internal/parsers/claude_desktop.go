@@ -11,26 +11,33 @@ import (
 	"time"
 )
 
-// ClaudeDesktopParser reads Claude Desktop code/cowork sessions from
-// the local-agent-mode-sessions directory. Each session has a metadata
-// JSON file and an audit.jsonl conversation log (same format as Claude Code).
+// ClaudeDesktopParser reads Claude Desktop code/cowork sessions.
 //
-// Chat-only sessions (no audit.jsonl) are skipped — they use IndexedDB
-// binary format which is not parseable.
+// Claude Desktop stores session data in two locations:
+//
+// 1. Legacy: local-agent-mode-sessions/{account}/{org}/local_{uuid}/audit.jsonl
+//    Older sessions with full audit logs alongside the metadata.
+//
+// 2. Current: claude-code-sessions/{account}/{org}/local_{uuid}.json
+//    Newer sessions store metadata here but conversation data is written to
+//    ~/.claude/projects/{cwd-hash}/{cliSessionId}.jsonl (same location as CLI).
+//    The cliSessionId in the metadata maps to the JSONL filename.
+//
+// Chat-only sessions (no audit.jsonl or cliSessionId) are skipped.
 type ClaudeDesktopParser struct {
-	sessionsDir string
-	lookback    time.Duration
+	appDir   string // ~/Library/Application Support/Claude/
+	lookback time.Duration
 }
 
 func NewClaudeDesktopParser() *ClaudeDesktopParser {
 	return &ClaudeDesktopParser{
-		sessionsDir: claudeDesktopSessionsPath(),
-		lookback:    24 * time.Hour,
+		appDir:   claudeDesktopAppDir(),
+		lookback: 24 * time.Hour,
 	}
 }
 
 func (p *ClaudeDesktopParser) Name() string   { return "claude_desktop" }
-func (p *ClaudeDesktopParser) DataDir() string { return p.sessionsDir }
+func (p *ClaudeDesktopParser) DataDir() string { return p.appDir }
 
 func (p *ClaudeDesktopParser) SetLookback(hours int) {
 	p.lookback = time.Duration(hours) * time.Hour
@@ -39,14 +46,17 @@ func (p *ClaudeDesktopParser) SetLookback(hours int) {
 // desktopSessionMeta holds the fields we need from local_{uuid}.json.
 type desktopSessionMeta struct {
 	SessionID      string `json:"sessionId"`
+	CLISessionID   string `json:"cliSessionId"`
+	CWD            string `json:"cwd"`
+	OriginCWD      string `json:"originCwd"`
 	LastActivityAt int64  `json:"lastActivityAt"` // unix ms
 	Model          string `json:"model"`
 	IsArchived     bool   `json:"isArchived"`
 }
 
 type desktopSession struct {
-	Meta       desktopSessionMeta
-	AuditPath  string // full path to audit.jsonl
+	Meta        desktopSessionMeta
+	DataPath    string // path to JSONL data (audit.jsonl or projects/*.jsonl)
 	AccountUUID string
 	OrgUUID     string
 }
@@ -54,32 +64,34 @@ type desktopSession struct {
 func (p *ClaudeDesktopParser) Collect(prevState map[string]any) ([]Record, map[string]any, error) {
 	newState := make(map[string]any)
 
-	if _, err := os.Stat(p.sessionsDir); os.IsNotExist(err) {
-		return nil, prevState, nil
-	}
-
 	offsets := restoreOffsets(prevState)
 
+	// Scan both legacy and current session directories
 	sessions, err := p.findActiveSessions()
 	if err != nil {
 		return nil, prevState, fmt.Errorf("scan desktop sessions: %w", err)
+	}
+
+	if len(sessions) == 0 {
+		newState["file_offsets"] = offsets
+		return nil, newState, nil
 	}
 
 	var records []Record
 	newOffsets := make(map[string]float64)
 
 	for _, sess := range sessions {
-		prevOffset := int64(offsets[sess.AuditPath])
+		prevOffset := int64(offsets[sess.DataPath])
 
 		recs, newOffset, err := ParseClaudeJSONLFile(
-			sess.AuditPath, prevOffset,
+			sess.DataPath, prevOffset,
 			"claude-desktop",
 			fmt.Sprintf("collector:claude-desktop:%s", sess.Meta.SessionID),
 			"Anthropic",
 		)
 		if err != nil {
-			log.Printf("[claude_desktop] Error parsing %s: %v", sess.AuditPath, err)
-			newOffsets[sess.AuditPath] = float64(prevOffset)
+			log.Printf("[claude_desktop] Error parsing %s: %v", sess.DataPath, err)
+			newOffsets[sess.DataPath] = float64(prevOffset)
 			continue
 		}
 
@@ -93,22 +105,55 @@ func (p *ClaudeDesktopParser) Collect(prevState map[string]any) ([]Record, map[s
 		}
 
 		records = append(records, recs...)
-		newOffsets[sess.AuditPath] = float64(newOffset)
+		newOffsets[sess.DataPath] = float64(newOffset)
 	}
 
 	newState["file_offsets"] = newOffsets
 	return records, newState, nil
 }
 
-// findActiveSessions walks local-agent-mode-sessions/{account}/{org}/
-// and returns sessions whose lastActivityAt falls within the lookback window.
+// DesktopSessionCLIIDs returns the set of cliSessionId values for active Desktop
+// sessions. The Claude Code parser uses this to skip JSONL files that belong to
+// Desktop (avoiding double-counting).
+func (p *ClaudeDesktopParser) DesktopSessionCLIIDs() map[string]bool {
+	sessions, _ := p.findActiveSessions()
+	ids := make(map[string]bool, len(sessions))
+	for _, s := range sessions {
+		if s.Meta.CLISessionID != "" {
+			ids[s.Meta.CLISessionID] = true
+		}
+	}
+	return ids
+}
+
 func (p *ClaudeDesktopParser) findActiveSessions() ([]desktopSession, error) {
-	accounts, err := os.ReadDir(p.sessionsDir)
-	if err != nil {
-		return nil, nil
+	cutoff := time.Now().Add(-p.lookback)
+	var sessions []desktopSession
+
+	// Scan legacy: local-agent-mode-sessions/{account}/{org}/
+	legacyDir := filepath.Join(p.appDir, "local-agent-mode-sessions")
+	if s, err := p.scanSessionDir(legacyDir, cutoff, true); err == nil {
+		sessions = append(sessions, s...)
 	}
 
-	cutoff := time.Now().Add(-p.lookback)
+	// Scan current: claude-code-sessions/{account}/{org}/
+	currentDir := filepath.Join(p.appDir, "claude-code-sessions")
+	if s, err := p.scanSessionDir(currentDir, cutoff, false); err == nil {
+		sessions = append(sessions, s...)
+	}
+
+	return sessions, nil
+}
+
+// scanSessionDir walks a {account}/{org}/ directory tree for session metadata.
+// If legacy=true, looks for audit.jsonl in a subdirectory.
+// If legacy=false, resolves cliSessionId to a ~/.claude/projects/ JSONL file.
+func (p *ClaudeDesktopParser) scanSessionDir(baseDir string, cutoff time.Time, legacy bool) ([]desktopSession, error) {
+	accounts, err := os.ReadDir(baseDir)
+	if err != nil {
+		return nil, nil // directory doesn't exist
+	}
+
 	var sessions []desktopSession
 
 	for _, acctEntry := range accounts {
@@ -120,7 +165,7 @@ func (p *ClaudeDesktopParser) findActiveSessions() ([]desktopSession, error) {
 			continue
 		}
 
-		orgs, err := os.ReadDir(filepath.Join(p.sessionsDir, acctName))
+		orgs, err := os.ReadDir(filepath.Join(baseDir, acctName))
 		if err != nil {
 			continue
 		}
@@ -134,21 +179,20 @@ func (p *ClaudeDesktopParser) findActiveSessions() ([]desktopSession, error) {
 				continue
 			}
 
-			orgDir := filepath.Join(p.sessionsDir, acctName, orgName)
-			sess, err := p.findSessionsInOrgDir(orgDir, acctName, orgName, cutoff)
+			orgDir := filepath.Join(baseDir, acctName, orgName)
+			found, err := p.findSessionsInDir(orgDir, acctName, orgName, cutoff, legacy)
 			if err != nil {
 				log.Printf("[claude_desktop] Error scanning %s: %v", orgDir, err)
 				continue
 			}
-			sessions = append(sessions, sess...)
+			sessions = append(sessions, found...)
 		}
 	}
 
 	return sessions, nil
 }
 
-// findSessionsInOrgDir scans an org directory for active sessions with audit.jsonl files.
-func (p *ClaudeDesktopParser) findSessionsInOrgDir(orgDir, accountUUID, orgUUID string, cutoff time.Time) ([]desktopSession, error) {
+func (p *ClaudeDesktopParser) findSessionsInDir(orgDir, accountUUID, orgUUID string, cutoff time.Time, legacy bool) ([]desktopSession, error) {
 	entries, err := os.ReadDir(orgDir)
 	if err != nil {
 		return nil, err
@@ -158,7 +202,6 @@ func (p *ClaudeDesktopParser) findSessionsInOrgDir(orgDir, accountUUID, orgUUID 
 
 	for _, entry := range entries {
 		name := entry.Name()
-		// Session metadata files: local_{uuid}.json (not directories, not .jsonl)
 		if entry.IsDir() || !strings.HasPrefix(name, "local_") || !strings.HasSuffix(name, ".json") {
 			continue
 		}
@@ -173,36 +216,89 @@ func (p *ClaudeDesktopParser) findSessionsInOrgDir(orgDir, accountUUID, orgUUID 
 			continue
 		}
 
-		// Check lookback window using lastActivityAt from metadata
+		// Check lookback window
 		if meta.LastActivityAt > 0 {
-			lastActivity := time.UnixMilli(meta.LastActivityAt)
-			if lastActivity.Before(cutoff) {
+			if time.UnixMilli(meta.LastActivityAt).Before(cutoff) {
 				continue
 			}
 		} else {
-			// Fall back to metadata file mtime
 			info, err := entry.Info()
 			if err != nil || info.ModTime().Before(cutoff) {
 				continue
 			}
 		}
 
-		// Check for audit.jsonl in the session directory
-		sessionDirName := strings.TrimSuffix(name, ".json")
-		auditPath := filepath.Join(orgDir, sessionDirName, "audit.jsonl")
-		if _, err := os.Stat(auditPath); os.IsNotExist(err) {
-			continue // chat-only session (no audit log)
+		// Resolve the JSONL data path
+		var dataPath string
+		if legacy {
+			// Legacy: audit.jsonl in a subdirectory alongside the metadata
+			sessionDirName := strings.TrimSuffix(name, ".json")
+			dataPath = filepath.Join(orgDir, sessionDirName, "audit.jsonl")
+		} else {
+			// Current: cliSessionId maps to ~/.claude/projects/{cwd-hash}/{id}.jsonl
+			if meta.CLISessionID == "" {
+				continue
+			}
+			dataPath = resolveClaudeProjectJSONL(meta.CLISessionID, meta.OriginCWD, meta.CWD)
+		}
+
+		if dataPath == "" {
+			continue
+		}
+		if _, err := os.Stat(dataPath); os.IsNotExist(err) {
+			continue
 		}
 
 		sessions = append(sessions, desktopSession{
 			Meta:        *meta,
-			AuditPath:   auditPath,
+			DataPath:    dataPath,
 			AccountUUID: accountUUID,
 			OrgUUID:     orgUUID,
 		})
 	}
 
 	return sessions, nil
+}
+
+// resolveClaudeProjectJSONL finds the JSONL file for a cliSessionId in ~/.claude/projects/.
+// Claude Code stores session files at ~/.claude/projects/{cwd-hash}/{sessionId}.jsonl
+// where cwd-hash is derived from the working directory path.
+func resolveClaudeProjectJSONL(cliSessionID, originCWD, cwd string) string {
+	home, _ := os.UserHomeDir()
+	projectsDir := filepath.Join(home, ".claude", "projects")
+
+	filename := cliSessionID + ".jsonl"
+
+	// Try to derive the cwd-hash directory name from the working directory.
+	// Claude Code converts "/" to "-" in the path to create the directory name.
+	for _, dir := range []string{originCWD, cwd} {
+		if dir == "" {
+			continue
+		}
+		// Claude Code uses the path with / replaced by - as the directory name
+		cwdHash := strings.ReplaceAll(dir, "/", "-")
+		candidate := filepath.Join(projectsDir, cwdHash, filename)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// Fallback: search all project directories for the session file
+	dirs, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return ""
+	}
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(projectsDir, d.Name(), filename)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	return ""
 }
 
 func readDesktopMeta(path string) (*desktopSessionMeta, error) {
@@ -217,14 +313,14 @@ func readDesktopMeta(path string) (*desktopSessionMeta, error) {
 	return &meta, nil
 }
 
-func claudeDesktopSessionsPath() string {
+func claudeDesktopAppDir() string {
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {
 	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "Claude", "local-agent-mode-sessions")
+		return filepath.Join(home, "Library", "Application Support", "Claude")
 	case "windows":
-		return filepath.Join(home, "AppData", "Roaming", "Claude", "local-agent-mode-sessions")
+		return filepath.Join(home, "AppData", "Roaming", "Claude")
 	default:
-		return filepath.Join(home, ".config", "Claude", "local-agent-mode-sessions")
+		return filepath.Join(home, ".config", "Claude")
 	}
 }

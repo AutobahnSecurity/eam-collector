@@ -72,6 +72,8 @@ func main() {
 
 	// Initialize parsers
 	var activeParsers []parsers.Parser
+	var desktopParser *parsers.ClaudeDesktopParser
+	var claudeParser *parsers.ClaudeParser
 	for name, pcfg := range cfg.Parsers {
 		if !pcfg.Enabled {
 			log.Printf("[%s] Disabled", name)
@@ -85,6 +87,19 @@ func main() {
 		p.SetLookback(cfg.Lookback)
 		activeParsers = append(activeParsers, p)
 		log.Printf("[%s] Enabled", name)
+		// Track Desktop and Claude parsers for session dedup
+		if dp, ok := p.(*parsers.ClaudeDesktopParser); ok {
+			desktopParser = dp
+		}
+		if cp, ok := p.(*parsers.ClaudeParser); ok {
+			claudeParser = cp
+		}
+	}
+
+	// Tell Claude Code parser which session IDs belong to Desktop
+	// so it skips them (they share the same JSONL files)
+	if desktopParser != nil && claudeParser != nil {
+		claudeParser.SetDesktopSessionIDs(desktopParser.DesktopSessionCLIIDs())
 	}
 
 	if len(activeParsers) == 0 {
