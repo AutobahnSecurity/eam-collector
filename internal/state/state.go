@@ -72,12 +72,14 @@ func (s *Store) Save() error {
 	return nil
 }
 
-// Close releases the file lock.
+// Close releases the file lock and removes the lock file.
 func (s *Store) Close() {
 	if s.lock != nil {
+		lockPath := s.lock.Name()
 		syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
 		s.lock.Close()
 		s.lock = nil
+		os.Remove(lockPath)
 	}
 }
 

@@ -67,6 +67,9 @@ func main() {
 	home, _ := os.UserHomeDir()
 	stateStore := state.New(filepath.Join(home, ".eam-collector"))
 	if err := stateStore.Load(); err != nil {
+		if strings.Contains(err.Error(), "already running") {
+			log.Fatalf("[error] %v — kill the other process first: pkill -f eam-collector", err)
+		}
 		log.Printf("[warn] Failed to load state: %v (starting fresh)", err)
 	}
 
