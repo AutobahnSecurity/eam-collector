@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -108,6 +109,16 @@ func (p *ClaudeDesktopParser) Collect(prevState map[string]any) ([]Record, map[s
 
 	// ── Path 2: Chat mode (tipTap editor state in IndexedDB WAL) ──
 	chatRecs, chatState := p.collectChat(prevState)
+	// Detect chat model from Local Storage
+	if len(chatRecs) > 0 {
+		if chatModel := p.detectChatModel(); chatModel != "" {
+			for i := range chatRecs {
+				if chatRecs[i].Model == "" {
+					chatRecs[i].Model = chatModel
+				}
+			}
+		}
+	}
 	records = append(records, chatRecs...)
 	// Merge chat state into newState
 	for k, v := range chatState {
@@ -229,6 +240,64 @@ func (p *ClaudeDesktopParser) collectChat(prevState map[string]any) ([]Record, m
 	state["chat_log_name"] = currentLogName
 
 	return records, state
+}
+
+// detectChatModel reads the currently selected model from Claude Desktop's
+// Local Storage (Chromium LevelDB). The model is stored as "api_model" in
+// the React Query cache within the WAL log file.
+func (p *ClaudeDesktopParser) detectChatModel() string {
+	lsDir := filepath.Join(p.appDir, "Local Storage", "leveldb")
+	entries, err := os.ReadDir(lsDir)
+	if err != nil {
+		return ""
+	}
+
+	// Check .log files first (active WAL has latest data), then .ldb
+	var files []string
+	for _, e := range entries {
+		name := e.Name()
+		if name == "LOG" || name == "LOG.old" || name == "LOCK" || name == "CURRENT" || e.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(name, ".log") {
+			files = append([]string{filepath.Join(lsDir, name)}, files...)
+		} else if strings.HasSuffix(name, ".ldb") {
+			files = append(files, filepath.Join(lsDir, name))
+		}
+	}
+
+	modelRe := regexp.MustCompile(`api_model.{0,10}(claude-[a-z]+-[0-9a-z.-]+)`)
+
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		// Search UTF-16LE decoded content (Chromium Local Storage uses UTF-16)
+		decoded := decodeUTF16LE(data)
+		if m := modelRe.FindStringSubmatch(decoded); len(m) > 1 {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// decodeUTF16LE decodes byte data as UTF-16LE, ignoring errors.
+func decodeUTF16LE(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+	// Fast path: decode pairs of bytes as UTF-16LE runes
+	var sb strings.Builder
+	sb.Grow(len(data) / 2)
+	for i := 0; i+1 < len(data); i += 2 {
+		r := rune(data[i]) | rune(data[i+1])<<8
+		if r == 0 {
+			continue
+		}
+		sb.WriteRune(r)
+	}
+	return sb.String()
 }
 
 // ── tipTap snapshot parsing ──
