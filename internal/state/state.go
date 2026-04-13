@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // Store persists per-parser state (file offsets, processed IDs, etc.)
@@ -28,15 +29,26 @@ func (s *Store) Load() error {
 		return err
 	}
 
-	// Acquire file lock to prevent concurrent collector instances
+	// Acquire file lock to prevent concurrent collector instances.
+	// Retry a few times with short delays — on restart, the old process
+	// may still be exiting when launchd starts the new one.
 	lockPath := s.path + ".lock"
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
-	if err != nil {
-		return fmt.Errorf("open lock file: %w", err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return fmt.Errorf("another eam-collector instance is already running (lock: %s)", lockPath)
+	var f *os.File
+	for attempt := 0; attempt < 5; attempt++ {
+		var err error
+		f, err = os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+		if err != nil {
+			return fmt.Errorf("open lock file: %w", err)
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			f.Close()
+			if attempt < 4 {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+				continue
+			}
+			return fmt.Errorf("another eam-collector instance is already running (lock: %s)", lockPath)
+		}
+		break
 	}
 	s.lock = f
 
