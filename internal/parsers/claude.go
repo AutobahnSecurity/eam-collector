@@ -100,6 +100,10 @@ func (p *ClaudeParser) Collect(prevState map[string]any) ([]Record, map[string]a
 // ParseClaudeJSONLFile reads a Claude-format JSONL file from the given byte offset,
 // parses user/assistant messages, and returns Records plus the new file offset.
 // Both Claude Code and Desktop audit.jsonl use the same JSONL format.
+//
+// On first encounter (offset == 0), the file is skipped — we seek to the end
+// and save the offset so only NEW messages written after this point are collected.
+// This prevents shipping entire session histories on first run.
 func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, aiVendor string) ([]Record, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -115,10 +119,13 @@ func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, ai
 		return nil, offset, nil
 	}
 
-	if offset > 0 {
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return nil, offset, err
-		}
+	// First encounter: skip to end, only collect new data from next run
+	if offset == 0 {
+		return nil, info.Size(), nil
+	}
+
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return nil, offset, err
 	}
 
 	var records []Record

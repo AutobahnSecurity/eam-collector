@@ -53,6 +53,12 @@ func (p *OpenCodeParser) Collect(prevState map[string]any) ([]Record, map[string
 		}
 	}
 
+	// First encounter: skip to current time, only collect new data from next run
+	if lastTS == 0 {
+		newState["last_processed_ts"] = float64(time.Now().UnixMilli())
+		return nil, newState, nil
+	}
+
 	// Open in read-only mode to avoid interfering with OpenCode
 	db, err := sql.Open("sqlite", p.dbPath+"?mode=ro")
 	if err != nil {

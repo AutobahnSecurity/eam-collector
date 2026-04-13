@@ -55,6 +55,13 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		}
 	}
 
+	// First encounter: skip to current time, only collect new data from next run
+	if lastTS == 0 {
+		newState["last_processed_ts"] = float64(time.Now().UnixMilli())
+		newState["processed_bubbles"] = []string{}
+		return nil, newState, nil
+	}
+
 	db, err := sql.Open("sqlite", p.dbPath+"?mode=ro")
 	if err != nil {
 		return nil, prevState, fmt.Errorf("open cursor db: %w", err)

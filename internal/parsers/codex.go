@@ -157,10 +157,13 @@ func (p *CodexParser) parseCodexJSONL(path string, offset int64, threadID, model
 		return nil, offset, nil
 	}
 
-	if offset > 0 {
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			return nil, offset, err
-		}
+	// First encounter: skip to end, only collect new data from next run
+	if offset == 0 {
+		return nil, info.Size(), nil
+	}
+
+	if _, err := f.Seek(offset, io.SeekStart); err != nil {
+		return nil, offset, err
 	}
 
 	sessionID := fmt.Sprintf("collector:codex:%s", threadID)
