@@ -2,6 +2,7 @@ package parsers
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,50 +13,28 @@ import (
 	"time"
 )
 
-// codexSessionMeta is the first line of each Codex JSONL session file.
-type codexSessionMeta struct {
-	ID            string `json:"id"`
-	ModelProvider string `json:"model_provider"`
-	AgentRole     string `json:"agent_role"`
-	CLIVersion    string `json:"cli_version"`
-}
-
-// codexLine represents a single JSONL line from a Codex session file.
-type codexLine struct {
-	Timestamp string          `json:"timestamp"` // ISO 8601
-	Item      json.RawMessage `json:"item"`
-}
-
-// codexItem is the tagged union wrapper for Codex events.
-type codexItem struct {
-	Type string `json:"type"`
-	// For response items
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
-	// For event messages
-	Event string `json:"event"`
-}
-
+// CodexParser reads OpenAI Codex CLI sessions using the SQLite metadata
+// database (state_5.sqlite) as an index, then reads conversation JSONL
+// files at the paths stored in the threads table.
 type CodexParser struct {
-	baseDir  string
+	homeDir  string // ~/.codex or $CODEX_HOME
 	lookback time.Duration
 }
 
 func NewCodexParser() *CodexParser {
 	home, _ := os.UserHomeDir()
-	// CODEX_HOME overrides the default
 	base := filepath.Join(home, ".codex")
 	if env := os.Getenv("CODEX_HOME"); env != "" {
 		base = env
 	}
 	return &CodexParser{
-		baseDir:  filepath.Join(base, "sessions"),
+		homeDir:  base,
 		lookback: 24 * time.Hour,
 	}
 }
 
 func (p *CodexParser) Name() string   { return "codex" }
-func (p *CodexParser) DataDir() string { return p.baseDir }
+func (p *CodexParser) DataDir() string { return filepath.Join(p.homeDir, "sessions") }
 
 func (p *CodexParser) SetLookback(hours int) {
 	p.lookback = time.Duration(hours) * time.Hour
@@ -64,48 +43,106 @@ func (p *CodexParser) SetLookback(hours int) {
 func (p *CodexParser) Collect(prevState map[string]any) ([]Record, map[string]any, error) {
 	newState := make(map[string]any)
 
-	if _, err := os.Stat(p.baseDir); os.IsNotExist(err) {
+	// Find the SQLite database — Codex uses state_N.sqlite with version suffix
+	dbPath := p.findStateDB()
+	if dbPath == "" {
 		return nil, prevState, nil
 	}
 
-	// Restore file offsets from previous state
-	offsets := make(map[string]float64)
-	if raw, ok := prevState["file_offsets"]; ok {
-		if m, ok := raw.(map[string]any); ok {
-			for k, v := range m {
-				if f, ok := v.(float64); ok {
-					offsets[k] = f
-				}
-			}
-		}
-	}
-
-	// Find JSONL files modified within lookback window
-	files, err := findCodexFiles(p.baseDir, p.lookback)
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro")
 	if err != nil {
-		return nil, prevState, fmt.Errorf("scan codex dir: %w", err)
+		return nil, prevState, fmt.Errorf("open codex db: %w", err)
+	}
+	defer db.Close()
+
+	// Verify schema
+	var tableCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='threads'`).Scan(&tableCount); err != nil || tableCount == 0 {
+		return nil, prevState, fmt.Errorf("schema changed: threads table not found")
 	}
 
+	// Query active threads within lookback
+	cutoffMS := time.Now().Add(-p.lookback).UnixMilli()
+	rows, err := db.Query(`
+		SELECT id, rollout_path, COALESCE(model, ''), COALESCE(model_provider, ''), tokens_used
+		FROM threads
+		WHERE updated_at > ? AND archived = 0
+		ORDER BY updated_at DESC
+	`, cutoffMS)
+	if err != nil {
+		return nil, prevState, fmt.Errorf("query threads: %w", err)
+	}
+	defer rows.Close()
+
+	offsets := restoreOffsets(prevState)
 	var records []Record
 	newOffsets := make(map[string]float64)
 
-	for _, path := range files {
-		prevOffset := int64(offsets[path])
-		recs, newOffset, err := p.parseFile(path, prevOffset)
+	for rows.Next() {
+		var id, rolloutPath, model, modelProvider string
+		var tokensUsed int64
+		if err := rows.Scan(&id, &rolloutPath, &model, &modelProvider, &tokensUsed); err != nil {
+			continue
+		}
+
+		if _, err := os.Stat(rolloutPath); os.IsNotExist(err) {
+			continue
+		}
+
+		prevOffset := int64(offsets[rolloutPath])
+		vendor := codexVendorName(modelProvider)
+
+		recs, newOffset, err := p.parseCodexJSONL(rolloutPath, prevOffset, id, model, vendor)
 		if err != nil {
-			log.Printf("[codex] Error parsing %s: %v", path, err)
-			newOffsets[path] = float64(prevOffset)
+			log.Printf("[codex] Error parsing %s: %v", rolloutPath, err)
+			newOffsets[rolloutPath] = float64(prevOffset)
 			continue
 		}
 		records = append(records, recs...)
-		newOffsets[path] = float64(newOffset)
+		newOffsets[rolloutPath] = float64(newOffset)
 	}
 
 	newState["file_offsets"] = newOffsets
-	return records, newState, nil
+	return records, newState, rows.Err()
 }
 
-func (p *CodexParser) parseFile(path string, offset int64) ([]Record, int64, error) {
+// findStateDB finds the Codex state SQLite database (state_N.sqlite).
+func (p *CodexParser) findStateDB() string {
+	entries, err := os.ReadDir(p.homeDir)
+	if err != nil {
+		return ""
+	}
+	// Find the highest-versioned state_N.sqlite
+	var best string
+	for _, e := range entries {
+		name := e.Name()
+		if strings.HasPrefix(name, "state_") && strings.HasSuffix(name, ".sqlite") {
+			candidate := filepath.Join(p.homeDir, name)
+			if best == "" || name > best {
+				best = candidate
+			}
+		}
+	}
+	return best
+}
+
+// codexJSONLLine represents a single line from a Codex session JSONL file.
+type codexJSONLLine struct {
+	Timestamp string          `json:"timestamp"` // ISO 8601
+	Type      string          `json:"type"`      // "session_meta", "response_item", "event_msg", "turn_context"
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// codexResponsePayload is the payload for type=response_item lines.
+type codexResponsePayload struct {
+	Role    string `json:"role"` // "user", "developer", "assistant"
+	Content []struct {
+		Type string `json:"type"` // "input_text", "output_text"
+		Text string `json:"text"`
+	} `json:"content"`
+}
+
+func (p *CodexParser) parseCodexJSONL(path string, offset int64, threadID, model, vendor string) ([]Record, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, offset, err
@@ -120,34 +157,13 @@ func (p *CodexParser) parseFile(path string, offset int64) ([]Record, int64, err
 		return nil, offset, nil
 	}
 
-	// For new files (offset 0), read the first line to get session metadata
-	var meta codexSessionMeta
-	var metaRead bool
-	if offset == 0 {
-		scanner := bufio.NewScanner(f)
-		scanner.Buffer(make([]byte, 512*1024), 512*1024)
-		if scanner.Scan() {
-			var firstLine struct {
-				Item json.RawMessage `json:"item"`
-			}
-			if err := json.Unmarshal(scanner.Bytes(), &firstLine); err == nil {
-				json.Unmarshal(firstLine.Item, &meta)
-				metaRead = true
-			}
-		}
-		// Reset to beginning so the main loop processes all lines
-		f.Seek(0, io.SeekStart)
-	}
-
-	// Seek to last known position
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
 			return nil, offset, err
 		}
 	}
 
-	// Derive session ID from filename: rollout-<timestamp>-<uuid>.jsonl
-	sessionID := fmt.Sprintf("collector:codex:%s", strings.TrimSuffix(filepath.Base(path), ".jsonl"))
+	sessionID := fmt.Sprintf("collector:codex:%s", threadID)
 
 	var records []Record
 	scanner := bufio.NewScanner(f)
@@ -159,30 +175,32 @@ func (p *CodexParser) parseFile(path string, offset int64) ([]Record, int64, err
 			continue
 		}
 
-		var cl codexLine
+		var cl codexJSONLLine
 		if err := json.Unmarshal(line, &cl); err != nil {
 			continue
 		}
 
-		// Parse the item to determine type
-		var item codexItem
-		if err := json.Unmarshal(cl.Item, &item); err != nil {
-			// Item might be a SessionMeta (first line) — skip
+		if cl.Type != "response_item" {
 			continue
 		}
 
-		// Extract content from response items
+		var payload codexResponsePayload
+		if err := json.Unmarshal(cl.Payload, &payload); err != nil {
+			continue
+		}
+
+		// Map roles: "user" → user, "assistant" → assistant, skip "developer" (system context)
 		role := ""
-		switch {
-		case item.Role == "user":
+		switch payload.Role {
+		case "user":
 			role = "user"
-		case item.Role == "assistant":
+		case "assistant":
 			role = "assistant"
 		default:
 			continue
 		}
 
-		content := extractCodexContent(item.Content)
+		content := extractCodexText(payload.Content)
 		if content == "" {
 			continue
 		}
@@ -192,11 +210,6 @@ func (p *CodexParser) parseFile(path string, offset int64) ([]Record, int64, err
 			ts = time.Now().UTC().Format(time.RFC3339)
 		}
 
-		model := ""
-		if metaRead && meta.ModelProvider != "" {
-			model = meta.ModelProvider
-		}
-
 		records = append(records, Record{
 			Source:    "codex",
 			SessionID: sessionID,
@@ -204,7 +217,7 @@ func (p *CodexParser) parseFile(path string, offset int64) ([]Record, int64, err
 			Role:      role,
 			Content:   content,
 			Model:     model,
-			AIVendor:  "OpenAI",
+			AIVendor:  vendor,
 		})
 	}
 
@@ -212,52 +225,38 @@ func (p *CodexParser) parseFile(path string, offset int64) ([]Record, int64, err
 	return records, newOffset, scanner.Err()
 }
 
-// extractCodexContent handles Codex content which can be a string or array of content parts.
-func extractCodexContent(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-
-	// Try as string
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
-	}
-
-	// Try as array of content parts [{type: "text", text: "..."}, ...]
-	var parts []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(raw, &parts); err == nil {
-		var texts []string
-		for _, p := range parts {
-			if p.Type == "text" && p.Text != "" {
-				texts = append(texts, p.Text)
+func extractCodexText(content []struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}) string {
+	var parts []string
+	for _, c := range content {
+		if (c.Type == "input_text" || c.Type == "output_text") && c.Text != "" {
+			// Skip system context XML tags
+			if strings.HasPrefix(c.Text, "<permissions") ||
+				strings.HasPrefix(c.Text, "<app-context>") ||
+				strings.HasPrefix(c.Text, "<environment_context>") ||
+				strings.HasPrefix(c.Text, "<turn_aborted>") {
+				continue
 			}
+			parts = append(parts, c.Text)
 		}
-		return strings.Join(texts, "\n")
 	}
-
-	return ""
+	return strings.Join(parts, "\n")
 }
 
-func findCodexFiles(baseDir string, lookback time.Duration) ([]string, error) {
-	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
-		return nil, nil
+func codexVendorName(provider string) string {
+	switch strings.ToLower(provider) {
+	case "openai":
+		return "OpenAI"
+	case "anthropic":
+		return "Anthropic"
+	case "google":
+		return "Google"
+	default:
+		if provider != "" {
+			return provider
+		}
+		return "OpenAI"
 	}
-
-	var files []string
-	err := filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil
-		}
-		if !info.IsDir() && strings.HasSuffix(path, ".jsonl") {
-			if time.Since(info.ModTime()) < lookback {
-				files = append(files, path)
-			}
-		}
-		return nil
-	})
-	return files, err
 }

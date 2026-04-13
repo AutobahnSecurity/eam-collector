@@ -74,6 +74,15 @@ func (p *ContinueParser) Collect(prevState map[string]any) ([]Record, map[string
 			continue // index file, skip
 		}
 
+		// Skip files outside lookback window
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if p.lookback > 0 && time.Since(info.ModTime()) > p.lookback {
+			continue
+		}
+
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue

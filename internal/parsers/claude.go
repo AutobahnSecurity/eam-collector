@@ -12,8 +12,9 @@ import (
 	"time"
 )
 
-// claudeLine represents a single JSONL line from Claude Code session files.
-type claudeLine struct {
+// ClaudeLine represents a single JSONL line from Claude Code / Desktop audit files.
+// Both tools use the same format.
+type ClaudeLine struct {
 	Type      string `json:"type"` // "user", "assistant", "system", etc.
 	SessionID string `json:"sessionId"`
 	Timestamp string `json:"timestamp"`
@@ -27,6 +28,8 @@ type claudeLine struct {
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 	} `json:"message"`
+	// Desktop audit.jsonl uses _audit_timestamp instead of timestamp
+	AuditTimestamp string `json:"_audit_timestamp"`
 }
 
 type ClaudeParser struct {
@@ -42,8 +45,8 @@ func NewClaudeParser() *ClaudeParser {
 	}
 }
 
-func (p *ClaudeParser) Name() string    { return "claude_code" }
-func (p *ClaudeParser) DataDir() string  { return p.baseDir }
+func (p *ClaudeParser) Name() string   { return "claude_code" }
+func (p *ClaudeParser) DataDir() string { return p.baseDir }
 
 func (p *ClaudeParser) SetLookback(hours int) {
 	p.lookback = time.Duration(hours) * time.Hour
@@ -52,19 +55,8 @@ func (p *ClaudeParser) SetLookback(hours int) {
 func (p *ClaudeParser) Collect(prevState map[string]any) ([]Record, map[string]any, error) {
 	newState := make(map[string]any)
 
-	// Restore file offsets from previous state
-	offsets := make(map[string]float64)
-	if raw, ok := prevState["file_offsets"]; ok {
-		if m, ok := raw.(map[string]any); ok {
-			for k, v := range m {
-				if f, ok := v.(float64); ok {
-					offsets[k] = f
-				}
-			}
-		}
-	}
+	offsets := restoreOffsets(prevState)
 
-	// Find JSONL files modified within lookback window
 	files, err := findJSONLFiles(p.baseDir, p.lookback)
 	if err != nil {
 		return nil, prevState, fmt.Errorf("scan claude dir: %w", err)
@@ -75,7 +67,8 @@ func (p *ClaudeParser) Collect(prevState map[string]any) ([]Record, map[string]a
 
 	for _, path := range files {
 		prevOffset := int64(offsets[path])
-		recs, newOffset, err := p.parseFile(path, prevOffset)
+		sessionID := filepath.Base(strings.TrimSuffix(path, ".jsonl"))
+		recs, newOffset, err := ParseClaudeJSONLFile(path, prevOffset, "claude-code", "collector:claude:"+sessionID, "Anthropic")
 		if err != nil {
 			log.Printf("[claude] Error parsing %s: %v", path, err)
 			newOffsets[path] = float64(prevOffset)
@@ -89,14 +82,18 @@ func (p *ClaudeParser) Collect(prevState map[string]any) ([]Record, map[string]a
 	return records, newState, nil
 }
 
-func (p *ClaudeParser) parseFile(path string, offset int64) ([]Record, int64, error) {
+// ── Shared helpers (used by claude.go and claude_desktop.go) ─────────
+
+// ParseClaudeJSONLFile reads a Claude-format JSONL file from the given byte offset,
+// parses user/assistant messages, and returns Records plus the new file offset.
+// Both Claude Code and Desktop audit.jsonl use the same JSONL format.
+func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, aiVendor string) ([]Record, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, offset, err
 	}
 	defer f.Close()
 
-	// Get file size — skip if unchanged
 	info, err := f.Stat()
 	if err != nil {
 		return nil, offset, err
@@ -105,7 +102,6 @@ func (p *ClaudeParser) parseFile(path string, offset int64) ([]Record, int64, er
 		return nil, offset, nil
 	}
 
-	// Seek to last known position
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
 			return nil, offset, err
@@ -122,49 +118,50 @@ func (p *ClaudeParser) parseFile(path string, offset int64) ([]Record, int64, er
 			continue
 		}
 
-		var cl claudeLine
+		var cl ClaudeLine
 		if err := json.Unmarshal(line, &cl); err != nil {
-			continue // skip malformed lines
+			continue
 		}
 
-		// Only process user and assistant messages
 		if cl.Type != "user" && cl.Type != "assistant" {
 			continue
 		}
 
-		content := extractContent(cl.Message.Content, cl.Type)
+		content := ExtractContent(cl.Message.Content)
 		if content == "" {
 			continue
 		}
 
+		// Prefer timestamp, fall back to _audit_timestamp (Desktop)
 		ts := cl.Timestamp
+		if ts == "" {
+			ts = cl.AuditTimestamp
+		}
 		if ts == "" {
 			ts = time.Now().UTC().Format(time.RFC3339)
 		}
 
-		sessionID := cl.SessionID
-		if sessionID == "" {
-			// Derive from filename
-			sessionID = filepath.Base(strings.TrimSuffix(path, ".jsonl"))
+		sessionID := sessionIDPrefix
+		if cl.SessionID != "" && !strings.HasPrefix(sessionIDPrefix, "collector:claude-desktop:") {
+			// For Claude Code, use the sessionId from the JSONL line
+			sessionID = "collector:claude:" + cl.SessionID
 		}
 
-		// Claude Code uses "<synthetic>" for tool-result/system messages
-		// that aren't real LLM calls. Filter to avoid polluting model data.
 		model := cl.Message.Model
 		if model == "<synthetic>" {
 			model = ""
 		}
 
 		records = append(records, Record{
-			Source:       "claude-code",
-			SessionID:    fmt.Sprintf("collector:claude:%s", sessionID),
+			Source:       source,
+			SessionID:    sessionID,
 			Timestamp:    ts,
 			Role:         cl.Message.Role,
 			Content:      content,
 			Model:        model,
 			InputTokens:  cl.Message.Usage.InputTokens,
 			OutputTokens: cl.Message.Usage.OutputTokens,
-			AIVendor:     "Anthropic",
+			AIVendor:     aiVendor,
 		})
 	}
 
@@ -172,19 +169,17 @@ func (p *ClaudeParser) parseFile(path string, offset int64) ([]Record, int64, er
 	return records, newOffset, scanner.Err()
 }
 
-// extractContent handles both string (user) and array (assistant) content formats.
-func extractContent(raw json.RawMessage, msgType string) string {
+// ExtractContent handles both string (user) and array (assistant) content formats.
+func ExtractContent(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
 
-	// Try as string first (user messages)
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
 		return s
 	}
 
-	// Try as array (assistant messages: [{type: "text", text: "..."}, ...])
 	var blocks []struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
@@ -202,6 +197,21 @@ func extractContent(raw json.RawMessage, msgType string) string {
 	return ""
 }
 
+// restoreOffsets extracts the file_offsets map from previous parser state.
+func restoreOffsets(prevState map[string]any) map[string]float64 {
+	offsets := make(map[string]float64)
+	if raw, ok := prevState["file_offsets"]; ok {
+		if m, ok := raw.(map[string]any); ok {
+			for k, v := range m {
+				if f, ok := v.(float64); ok {
+					offsets[k] = f
+				}
+			}
+		}
+	}
+	return offsets
+}
+
 func findJSONLFiles(baseDir string, lookback time.Duration) ([]string, error) {
 	if _, err := os.Stat(baseDir); os.IsNotExist(err) {
 		return nil, nil
@@ -210,10 +220,9 @@ func findJSONLFiles(baseDir string, lookback time.Duration) ([]string, error) {
 	var files []string
 	err := filepath.Walk(baseDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil // skip inaccessible dirs
+			return nil
 		}
 		if !info.IsDir() && strings.HasSuffix(path, ".jsonl") {
-			// Only read files modified within the lookback window (active sessions)
 			if time.Since(info.ModTime()) < lookback {
 				files = append(files, path)
 			}

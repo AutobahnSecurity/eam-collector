@@ -55,7 +55,7 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		}
 	}
 
-	db, err := sql.Open("sqlite", p.dbPath)
+	db, err := sql.Open("sqlite", p.dbPath+"?mode=ro")
 	if err != nil {
 		return nil, prevState, fmt.Errorf("open cursor db: %w", err)
 	}
