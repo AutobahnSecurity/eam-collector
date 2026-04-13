@@ -205,6 +205,10 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		} else {
 			log.Println("[heartbeat] OK")
 		}
+		// Save state even with no records — parser offsets still need persisting
+		if err := store.Save(); err != nil {
+			log.Printf("[state] Failed to save: %v", err)
+		}
 		return
 	}
 

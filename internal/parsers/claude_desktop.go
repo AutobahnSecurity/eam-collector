@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -65,20 +66,14 @@ func (p *ClaudeDesktopParser) Collect(prevState map[string]any) ([]Record, map[s
 	newState := make(map[string]any)
 
 	offsets := restoreOffsets(prevState)
-
-	// Scan both legacy and current session directories
-	sessions, err := p.findActiveSessions()
-	if err != nil {
-		return nil, prevState, fmt.Errorf("scan desktop sessions: %w", err)
-	}
-
-	if len(sessions) == 0 {
-		newState["file_offsets"] = offsets
-		return nil, newState, nil
-	}
-
 	var records []Record
 	newOffsets := make(map[string]float64)
+
+	// ── Path 1: Code/Cowork sessions (JSONL files) ──
+	sessions, err := p.findActiveSessions()
+	if err != nil {
+		log.Printf("[claude_desktop] Error scanning sessions: %v", err)
+	}
 
 	for _, sess := range sessions {
 		prevOffset := int64(offsets[sess.DataPath])
@@ -95,7 +90,6 @@ func (p *ClaudeDesktopParser) Collect(prevState map[string]any) ([]Record, map[s
 			continue
 		}
 
-		// Inject identity from directory path and model from metadata
 		identity := &AccountIdentity{
 			AccountUUID:      sess.AccountUUID,
 			OrganizationUUID: sess.OrgUUID,
@@ -112,8 +106,257 @@ func (p *ClaudeDesktopParser) Collect(prevState map[string]any) ([]Record, map[s
 		newOffsets[sess.DataPath] = float64(newOffset)
 	}
 
+	// ── Path 2: Chat mode (tipTap editor state in IndexedDB WAL) ──
+	chatRecs, chatState := p.collectChat(prevState)
+	records = append(records, chatRecs...)
+	// Merge chat state into newState
+	for k, v := range chatState {
+		newState[k] = v
+	}
+
 	newState["file_offsets"] = newOffsets
 	return records, newState, nil
+}
+
+// collectChat reads user messages from Claude Desktop chat mode.
+// Chat mode stores editor drafts as tipTapEditorState JSON in the IndexedDB WAL log.
+// As the user types, snapshots grow in length. When the text gets significantly shorter,
+// the user submitted the previous message and started a new one.
+func (p *ClaudeDesktopParser) collectChat(prevState map[string]any) ([]Record, map[string]any) {
+	state := make(map[string]any)
+
+	idbDir := filepath.Join(p.appDir, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb")
+	logPath := findNewestLog(idbDir)
+	if logPath == "" {
+		return nil, state
+	}
+
+	info, err := os.Stat(logPath)
+	if err != nil || time.Since(info.ModTime()) > p.lookback {
+		return nil, state
+	}
+
+	// Restore previous chat state
+	var prevOffset float64
+	if v, ok := prevState["chat_log_offset"]; ok {
+		if f, ok := v.(float64); ok {
+			prevOffset = f
+		}
+	}
+	var prevLogName string
+	if v, ok := prevState["chat_log_name"]; ok {
+		if s, ok := v.(string); ok {
+			prevLogName = s
+		}
+	}
+	var lastTS float64
+	if v, ok := prevState["chat_last_ts"]; ok {
+		if f, ok := v.(float64); ok {
+			lastTS = f
+		}
+	}
+
+	// Detect WAL rotation — reset offset if log file changed
+	currentLogName := filepath.Base(logPath)
+	if prevLogName != "" && currentLogName != prevLogName {
+		prevOffset = 0
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return nil, state
+	}
+
+	startOffset := int(prevOffset)
+	if startOffset > len(data) {
+		startOffset = 0 // log was rotated/truncated
+	}
+
+	// First encounter: skip to end
+	if startOffset == 0 && prevLogName == "" {
+		state["chat_log_offset"] = float64(len(data))
+		state["chat_log_name"] = currentLogName
+		state["chat_last_ts"] = lastTS
+		return nil, state
+	}
+
+	text := string(data[startOffset:])
+	snapshots := extractSnapshots(text)
+
+	if len(snapshots) == 0 {
+		state["chat_log_offset"] = float64(len(data))
+		state["chat_log_name"] = currentLogName
+		state["chat_last_ts"] = lastTS
+		return nil, state
+	}
+
+	messages := extractSentMessages(snapshots, lastTS)
+
+	var records []Record
+	var maxTS float64
+
+	for _, msg := range messages {
+		if msg.Timestamp <= lastTS {
+			continue
+		}
+		if time.Since(time.UnixMilli(int64(msg.Timestamp))) > p.lookback {
+			continue
+		}
+
+		ts := time.UnixMilli(int64(msg.Timestamp)).UTC().Format(time.RFC3339)
+		sessionID := fmt.Sprintf("collector:claude-desktop:chat-%d", int64(msg.Timestamp)/3600000)
+
+		records = append(records, Record{
+			Source:    "claude-desktop",
+			SessionID: sessionID,
+			Timestamp: ts,
+			Role:      "user",
+			Content:   msg.Text,
+			AIVendor:  "Anthropic",
+		})
+
+		if msg.Timestamp > maxTS {
+			maxTS = msg.Timestamp
+		}
+	}
+
+	if maxTS > lastTS {
+		state["chat_last_ts"] = maxTS
+	} else {
+		state["chat_last_ts"] = lastTS
+	}
+	state["chat_log_offset"] = float64(len(data))
+	state["chat_log_name"] = currentLogName
+
+	return records, state
+}
+
+// ── tipTap snapshot parsing ──
+
+type tipTapSnapshot struct {
+	State struct {
+		TipTapEditorState struct {
+			Content []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"content"`
+		} `json:"tipTapEditorState"`
+	} `json:"state"`
+	UpdatedAt int64 `json:"updatedAt"` // Unix millis
+}
+
+type sentMessage struct {
+	Text      string
+	Timestamp float64
+}
+
+func extractSnapshots(text string) []tipTapSnapshot {
+	var snapshots []tipTapSnapshot
+	idx := 0
+	for {
+		start := strings.Index(text[idx:], `{"state":{"tipTapEditorState":`)
+		if start == -1 {
+			break
+		}
+		start += idx
+
+		depth := 0
+		end := -1
+		for i := start; i < len(text) && i < start+10000; i++ {
+			if text[i] == '{' {
+				depth++
+			} else if text[i] == '}' {
+				depth--
+				if depth == 0 {
+					end = i + 1
+					break
+				}
+			}
+		}
+
+		if end == -1 {
+			idx = start + 1
+			continue
+		}
+
+		var snap tipTapSnapshot
+		if err := json.Unmarshal([]byte(text[start:end]), &snap); err == nil && snap.UpdatedAt > 0 {
+			snapshots = append(snapshots, snap)
+		}
+		idx = end
+	}
+
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].UpdatedAt < snapshots[j].UpdatedAt
+	})
+
+	return snapshots
+}
+
+func extractSentMessages(snapshots []tipTapSnapshot, afterTS float64) []sentMessage {
+	var messages []sentMessage
+	var prevText string
+	var prevTS float64
+
+	for _, snap := range snapshots {
+		text := ""
+		for _, block := range snap.State.TipTapEditorState.Content {
+			for _, inline := range block.Content {
+				text += inline.Text
+			}
+		}
+		text = strings.TrimSpace(text)
+		if text == "" {
+			continue
+		}
+
+		ts := float64(snap.UpdatedAt)
+
+		// Detect message boundary: text got significantly shorter or time gap > 10s
+		if prevText != "" && (len(text) < len(prevText)/2 || (ts-prevTS > 10000 && len(text) < len(prevText))) {
+			if len(prevText) > 3 && prevTS > afterTS {
+				messages = append(messages, sentMessage{Text: prevText, Timestamp: prevTS})
+			}
+		}
+
+		prevText = text
+		prevTS = ts
+	}
+
+	// Last message being typed
+	if prevText != "" && len(prevText) > 3 && prevTS > afterTS {
+		messages = append(messages, sentMessage{Text: prevText, Timestamp: prevTS})
+	}
+
+	return messages
+}
+
+// findNewestLog finds the most recently modified .log file in a LevelDB directory.
+func findNewestLog(dir string) string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var best string
+	var bestMtime int64
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".log") {
+			continue
+		}
+		if e.Name() == "LOG" || e.Name() == "LOG.old" {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if mt := info.ModTime().UnixNano(); mt > bestMtime {
+			bestMtime = mt
+			best = filepath.Join(dir, e.Name())
+		}
+	}
+	return best
 }
 
 // DesktopSessionCLIIDs returns the set of cliSessionId values for active Desktop
