@@ -145,6 +145,7 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 
 	var allRecords []parsers.Record
 	var healths []parsers.Health
+	var parserSummary []string
 
 	for _, p := range pp {
 		prevState := store.Get(p.Name())
@@ -160,6 +161,7 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 			h.Status = "error"
 			h.Error = err.Error()
 			log.Printf("[%s] Error: %v", p.Name(), err)
+			parserSummary = append(parserSummary, fmt.Sprintf("%s:err", p.Name()))
 		} else if _, statErr := os.Stat(p.DataDir()); os.IsNotExist(statErr) {
 			h.Status = "not_installed"
 		} else if len(records) == 0 {
@@ -168,12 +170,18 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 			h.Status = "ok"
 			log.Printf("[%s] Collected %d records", p.Name(), len(records))
 			allRecords = append(allRecords, records...)
+			parserSummary = append(parserSummary, fmt.Sprintf("%s:%d", p.Name(), len(records)))
 		}
 
 		healths = append(healths, h)
 		if err == nil {
 			store.Set(p.Name(), newState)
 		}
+	}
+
+	// Always log a heartbeat so it's clear the collector is alive
+	if len(allRecords) == 0 {
+		log.Println("[heartbeat] No new records")
 	}
 
 	// Log health warnings
