@@ -171,17 +171,26 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 	// Per-session identity: snapshot the current account when a session is
 	// first seen. This ensures governance is determined by the account active
 	// at session creation, not the current account (which may have changed).
-	currentIdentity := parsers.ReadClaudeIdentity()
+	//
+	// Each identity's Tool field matches the record Source it governs
+	// (e.g., "claude-code" identity governs "claude-code" records).
+	currentIdentities := parsers.ReadClaudeIdentities()
+	identityBySource := make(map[string]parsers.AccountIdentity, len(currentIdentities))
+	for _, id := range currentIdentities {
+		identityBySource[id.Tool] = id
+	}
 	sessionIDs := loadSessionIdentities(store)
 
 	for _, r := range allRecords {
 		entry, exists := sessionIDs[r.SessionID]
-		if !exists && currentIdentity != nil {
-			sessionIDs[r.SessionID] = sessionIdentityEntry{
-				Identity: *currentIdentity,
-				LastSeen: time.Now(),
+		if !exists {
+			if id, ok := identityBySource[r.Source]; ok {
+				sessionIDs[r.SessionID] = sessionIdentityEntry{
+					Identity: id,
+					LastSeen: time.Now(),
+				}
 			}
-		} else if exists {
+		} else {
 			// Refresh last-seen so active sessions don't expire
 			entry.LastSeen = time.Now()
 			sessionIDs[r.SessionID] = entry
@@ -197,10 +206,13 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 	}
 	saveSessionIdentities(store, sessionIDs)
 
-	// Group records by org UUID so each batch carries the correct identity
+	// Group records by org UUID so each batch carries the correct identity.
+	// Accumulate all unique tool identities per org (e.g., both claude-code
+	// and claude-desktop when both sources have records for the same org).
 	type batch struct {
 		identity []parsers.AccountIdentity
 		records  []parsers.Record
+		tools    map[string]bool // track which tools already added
 	}
 	groups := make(map[string]*batch)
 	for _, r := range allRecords {
@@ -212,11 +224,12 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		}
 		b := groups[orgKey]
 		if b == nil {
-			b = &batch{}
-			if id != nil {
-				b.identity = []parsers.AccountIdentity{*id}
-			}
+			b = &batch{tools: make(map[string]bool)}
 			groups[orgKey] = b
+		}
+		if id != nil && !b.tools[id.Tool] {
+			b.identity = append(b.identity, *id)
+			b.tools[id.Tool] = true
 		}
 		b.records = append(b.records, r)
 	}
