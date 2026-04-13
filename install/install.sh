@@ -45,9 +45,26 @@ if [ ! -f "${CONFIG_DIR}/config.yaml" ]; then
         cp "$1" "${CONFIG_DIR}/config.yaml"
         echo "  Config copied from $1"
     else
-        cp config.example.yaml "${CONFIG_DIR}/config.yaml" 2>/dev/null || true
-        echo "  Config template created at ${CONFIG_DIR}/config.yaml"
-        echo "  >>> Edit ${CONFIG_DIR}/config.yaml with your server URL and API key <<<"
+        SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+        EXAMPLE_CONFIG=""
+        for candidate in \
+            "${SCRIPT_DIR}/../config.example.yaml" \
+            "${SCRIPT_DIR}/config.example.yaml" \
+            "config.example.yaml"; do
+            if [ -f "$candidate" ]; then
+                EXAMPLE_CONFIG="$candidate"
+                break
+            fi
+        done
+
+        if [ -n "$EXAMPLE_CONFIG" ]; then
+            cp "$EXAMPLE_CONFIG" "${CONFIG_DIR}/config.yaml"
+            echo "  Config template created at ${CONFIG_DIR}/config.yaml"
+            echo "  >>> Edit ${CONFIG_DIR}/config.yaml with your server URL and API key <<<"
+        else
+            echo "  WARNING: config.example.yaml not found — no config file created."
+            echo "  Create ${CONFIG_DIR}/config.yaml manually before starting the service."
+        fi
     fi
 fi
 
