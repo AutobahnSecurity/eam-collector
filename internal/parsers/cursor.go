@@ -55,32 +55,53 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		}
 	}
 
-	// First encounter: skip to current time, only collect new data from next run
-	if lastTS == 0 {
-		newState["last_processed_ts"] = float64(time.Now().UnixMilli())
-		newState["processed_bubbles"] = []string{}
-		return nil, newState, nil
-	}
-
 	db, err := sql.Open("sqlite", p.dbPath+"?mode=ro")
 	if err != nil {
 		return nil, prevState, fmt.Errorf("open cursor db: %w", err)
 	}
 	defer db.Close()
 
-	var records []Record
-	var maxTS float64
-
-	// Strategy: read composerData entries. Depending on version:
-	// - Old (v1-v3): messages in separate bubbleId: rows
-	// - New (v14+): messages inline in the conversation field or text/richText
-
-	// Schema check: verify cursorDiskKV table exists and has expected data
 	var tableCount int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='cursorDiskKV'`).Scan(&tableCount); err != nil || tableCount == 0 {
-		// Table doesn't exist — Cursor may have changed its schema
-		return nil, prevState, fmt.Errorf("schema changed: cursorDiskKV table not found (Cursor may have updated)")
+		return nil, prevState, fmt.Errorf("schema changed: cursorDiskKV table not found")
 	}
+
+	// First encounter: find the max createdAt from existing composers and all bubble keys.
+	// Save them as baseline — only data AFTER this point gets collected.
+	if lastTS == 0 {
+		var maxCreatedAt float64
+		rows, err := db.Query(`SELECT value FROM cursorDiskKV WHERE key LIKE 'composerData:%'`)
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var value []byte
+				if err := rows.Scan(&value); err != nil {
+					continue
+				}
+				var raw map[string]json.RawMessage
+				if json.Unmarshal(value, &raw) != nil {
+					continue
+				}
+				var ca float64
+				if v, ok := raw["createdAt"]; ok {
+					json.Unmarshal(v, &ca)
+				}
+				if ca > maxCreatedAt {
+					maxCreatedAt = ca
+				}
+			}
+		}
+		if maxCreatedAt == 0 {
+			maxCreatedAt = float64(time.Now().UnixMilli())
+		}
+		allBubbles, _ := p.getAllBubbleKeys(db)
+		newState["last_processed_ts"] = maxCreatedAt
+		newState["processed_bubbles"] = allBubbles
+		return nil, newState, nil
+	}
+
+	var records []Record
+	var maxTS float64
 
 	rows, err := db.Query(`SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%'`)
 	if err != nil {
