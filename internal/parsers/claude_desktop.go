@@ -95,12 +95,16 @@ func (p *ClaudeDesktopParser) Collect(prevState map[string]any) ([]Record, map[s
 			continue
 		}
 
-		// Inject model from metadata if not in JSONL lines
-		if sess.Meta.Model != "" {
-			for i := range recs {
-				if recs[i].Model == "" {
-					recs[i].Model = sess.Meta.Model
-				}
+		// Inject identity from directory path and model from metadata
+		identity := &AccountIdentity{
+			AccountUUID:      sess.AccountUUID,
+			OrganizationUUID: sess.OrgUUID,
+			Tool:             "claude-desktop",
+		}
+		for i := range recs {
+			recs[i].Identity = identity
+			if sess.Meta.Model != "" && recs[i].Model == "" {
+				recs[i].Model = sess.Meta.Model
 			}
 		}
 

@@ -199,9 +199,18 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 	for _, r := range allRecords {
 		entry, exists := sessionIDs[r.SessionID]
 		if !exists {
-			if id, ok := identityBySource[r.Source]; ok {
+			// Prefer per-record identity (from parser, e.g. Desktop directory path),
+			// fall back to global identity lookup (statsig cache).
+			// This handles users who only use Desktop without ever using the CLI.
+			var id *parsers.AccountIdentity
+			if r.Identity != nil {
+				id = r.Identity
+			} else if globalID, ok := identityBySource[r.Source]; ok {
+				id = &globalID
+			}
+			if id != nil {
 				sessionIDs[r.SessionID] = sessionIdentityEntry{
-					Identity: id,
+					Identity: *id,
 					LastSeen: time.Now(),
 				}
 			}

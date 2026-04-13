@@ -22,6 +22,10 @@ type Record struct {
 	OutputTokens int     `json:"output_tokens,omitempty"`
 	Cost         float64 `json:"cost,omitempty"`
 	AIVendor     string  `json:"ai_vendor"`
+	// Identity is set by parsers that know the account/org from their data source
+	// (e.g., Desktop parser extracts it from the directory path). When set, main.go
+	// uses this instead of the global identity lookup.
+	Identity     *AccountIdentity `json:"-"`
 }
 
 // Health reports the status of a parser after collection.
