@@ -10,9 +10,7 @@ interval: 60
 lookback: 24
 
 parsers:
-  claude_code:
-    enabled: true
-  claude_desktop:
+  claude:
     enabled: true
   cursor:
     enabled: true

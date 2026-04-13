@@ -3,17 +3,16 @@ package parsers
 import (
 	"bufio"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
 
 // ClaudeLine represents a single JSONL line from Claude Code / Desktop audit files.
-// Both tools use the same format.
 type ClaudeLine struct {
 	Type      string `json:"type"` // "user", "assistant", "system", etc.
 	SessionID string `json:"sessionId"`
@@ -28,101 +27,287 @@ type ClaudeLine struct {
 			OutputTokens int `json:"output_tokens"`
 		} `json:"usage"`
 	} `json:"message"`
-	// Desktop audit.jsonl uses _audit_timestamp instead of timestamp
 	AuditTimestamp string `json:"_audit_timestamp"`
 }
 
+// desktopSessionMeta holds the fields we need from local_{uuid}.json.
+type desktopSessionMeta struct {
+	SessionID      string `json:"sessionId"`
+	CLISessionID   string `json:"cliSessionId"`
+	CWD            string `json:"cwd"`
+	OriginCWD      string `json:"originCwd"`
+	LastActivityAt int64  `json:"lastActivityAt"` // unix ms
+	Model          string `json:"model"`
+	IsArchived     bool   `json:"isArchived"`
+}
+
+// activeSession represents a Claude session that is currently active.
+type activeSession struct {
+	DataPath string           // path to JSONL file
+	Source   string           // "claude-desktop" or "claude-code"
+	Identity *AccountIdentity // from Desktop dir path or statsig
+}
+
+// ── Unified Claude Parser ──────────────────────────────────────────────
+//
+// Handles all Claude surfaces: Desktop (chat, code, cowork) and standalone CLI.
+// Uses Desktop session metadata (lastActivityAt) as the primary signal for
+// active sessions, with JSONL mtime as fallback for standalone CLI.
+
 type ClaudeParser struct {
-	baseDir           string // defaults to ~/.claude/projects/
-	lookback          time.Duration
-	desktopSessionIDs map[string]bool // cliSessionIds owned by Desktop (skip in CLI parser)
+	projectsDir string // ~/.claude/projects/
+	desktopDir  string // ~/Library/Application Support/Claude/
+	lookback    time.Duration
 }
 
 func NewClaudeParser() *ClaudeParser {
 	home, _ := os.UserHomeDir()
 	return &ClaudeParser{
-		baseDir:  filepath.Join(home, ".claude", "projects"),
-		lookback: 24 * time.Hour,
+		projectsDir: filepath.Join(home, ".claude", "projects"),
+		desktopDir:  claudeDesktopAppDir(),
+		lookback:    24 * time.Hour,
 	}
 }
 
-// SetDesktopSessionIDs sets the cliSessionIds that belong to Desktop code sessions.
-// The Claude Code parser will skip these files to avoid double-counting.
-func (p *ClaudeParser) SetDesktopSessionIDs(ids map[string]bool) {
-	p.desktopSessionIDs = ids
-}
-
-func (p *ClaudeParser) Name() string   { return "claude_code" }
-func (p *ClaudeParser) DataDir() string { return p.baseDir }
+func (p *ClaudeParser) Name() string   { return "claude" }
+func (p *ClaudeParser) DataDir() string { return p.projectsDir }
 
 func (p *ClaudeParser) SetLookback(hours int) {
 	p.lookback = time.Duration(hours) * time.Hour
 }
 
 func (p *ClaudeParser) Collect(prevState map[string]any) ([]Record, map[string]any, error) {
-	newState := make(map[string]any)
-
 	offsets := restoreOffsets(prevState)
+	knownFiles := restoreKnownFiles(prevState)
 
-	files, err := findJSONLFiles(p.baseDir, p.lookback)
-	if err != nil {
-		return nil, prevState, fmt.Errorf("scan claude dir: %w", err)
+	sessions := p.findActiveSessions()
+	if len(sessions) == 0 {
+		// Nothing active — carry forward state, no records
+		return nil, prevState, nil
 	}
 
 	var records []Record
 	newOffsets := make(map[string]float64)
+	newKnown := make(map[string]bool)
 
-	for _, path := range files {
-		sessionID := filepath.Base(strings.TrimSuffix(path, ".jsonl"))
+	for _, sess := range sessions {
+		path := sess.DataPath
+		newKnown[path] = true
 
-		// Skip JSONL files that belong to Desktop code sessions
-		if p.desktopSessionIDs[sessionID] {
+		info, err := os.Stat(path)
+		if err != nil {
 			continue
 		}
 
+		if !knownFiles[path] {
+			// New file: baseline to current size, emit nothing
+			newOffsets[path] = float64(info.Size())
+			log.Printf("[claude] Baselined %s (%d bytes)", filepath.Base(path), info.Size())
+			continue
+		}
+
+		// Known file: read incrementally from stored offset
 		prevOffset := int64(offsets[path])
-		recs, newOffset, err := ParseClaudeJSONLFile(path, prevOffset, "claude-code", "collector:claude:"+sessionID, "Anthropic")
-		if err != nil {
-			log.Printf("[claude] Error parsing %s: %v", path, err)
+		if info.Size() <= prevOffset {
+			// No new data
 			newOffsets[path] = float64(prevOffset)
 			continue
 		}
+
+		recs, newOffset, err := parseJSONL(path, prevOffset)
+		if err != nil {
+			log.Printf("[claude] Error parsing %s: %v", filepath.Base(path), err)
+			newOffsets[path] = float64(prevOffset)
+			continue
+		}
+
+		// Tag records with source and identity
+		for i := range recs {
+			recs[i].Source = sess.Source
+			recs[i].AIVendor = "Anthropic"
+			recs[i].Identity = sess.Identity
+		}
+
 		records = append(records, recs...)
 		newOffsets[path] = float64(newOffset)
 	}
 
-	newState["file_offsets"] = newOffsets
+	// Carry forward known files not active this cycle (prevents re-baselining)
+	for path := range knownFiles {
+		if !newKnown[path] {
+			newKnown[path] = true
+			if off, ok := offsets[path]; ok {
+				newOffsets[path] = off
+			}
+		}
+	}
+
+	newState := map[string]any{
+		"file_offsets": newOffsets,
+		"known_files":  newKnown,
+	}
 	return records, newState, nil
 }
 
-// ── Shared helpers (used by claude.go and claude_desktop.go) ─────────
+// ── Active Session Detection ───────────────────────────────────────────
 
-// ParseClaudeJSONLFile reads a Claude-format JSONL file from the given byte offset,
-// parses user/assistant messages, and returns Records plus the new file offset.
-// Both Claude Code and Desktop audit.jsonl use the same JSONL format.
-//
-// On first encounter (offset == 0), the file is skipped — we seek to the end
-// and save the offset so only NEW messages written after this point are collected.
-// This prevents shipping entire session histories on first run.
-func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, aiVendor string) ([]Record, int64, error) {
+func (p *ClaudeParser) findActiveSessions() []activeSession {
+	cutoff := time.Now().Add(-p.lookback)
+
+	// Phase 1: Desktop sessions (primary — uses lastActivityAt from metadata)
+	desktopSessions, claimedPaths := p.scanDesktopSessions(cutoff)
+
+	// Phase 2: Standalone CLI (fallback — JSONL mtime for non-Desktop sessions)
+	cliSessions := p.scanStandaloneCLI(cutoff, claimedPaths)
+
+	return append(desktopSessions, cliSessions...)
+}
+
+// scanDesktopSessions reads Desktop session metadata to find active sessions.
+// Returns sessions and a set of JSONL paths claimed by Desktop (for dedup).
+func (p *ClaudeParser) scanDesktopSessions(cutoff time.Time) ([]activeSession, map[string]bool) {
+	claimed := make(map[string]bool)
+	var sessions []activeSession
+
+	for _, baseDir := range []string{
+		filepath.Join(p.desktopDir, "claude-code-sessions"),
+		filepath.Join(p.desktopDir, "local-agent-mode-sessions"),
+	} {
+		accounts, err := os.ReadDir(baseDir)
+		if err != nil {
+			continue
+		}
+
+		for _, acctEntry := range accounts {
+			if !acctEntry.IsDir() {
+				continue
+			}
+			acctName := acctEntry.Name()
+			if acctName == "skills-plugin" || !uuidRe.MatchString(acctName) {
+				continue
+			}
+
+			orgs, err := os.ReadDir(filepath.Join(baseDir, acctName))
+			if err != nil {
+				continue
+			}
+
+			for _, orgEntry := range orgs {
+				if !orgEntry.IsDir() || !uuidRe.MatchString(orgEntry.Name()) {
+					continue
+				}
+
+				orgDir := filepath.Join(baseDir, acctName, orgEntry.Name())
+				found := p.findDesktopSessionsInDir(orgDir, acctName, orgEntry.Name(), cutoff)
+
+				for _, sess := range found {
+					claimed[sess.DataPath] = true
+					sessions = append(sessions, sess)
+				}
+			}
+		}
+	}
+
+	return sessions, claimed
+}
+
+func (p *ClaudeParser) findDesktopSessionsInDir(orgDir, accountUUID, orgUUID string, cutoff time.Time) []activeSession {
+	entries, err := os.ReadDir(orgDir)
+	if err != nil {
+		return nil
+	}
+
+	var sessions []activeSession
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "local_") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+
+		meta, err := readDesktopMeta(filepath.Join(orgDir, name))
+		if err != nil || meta.IsArchived {
+			continue
+		}
+
+		// Check lookback window
+		if meta.LastActivityAt > 0 {
+			if time.UnixMilli(meta.LastActivityAt).Before(cutoff) {
+				continue
+			}
+		} else {
+			info, err := entry.Info()
+			if err != nil || info.ModTime().Before(cutoff) {
+				continue
+			}
+		}
+
+		// Resolve cliSessionId → JSONL path
+		if meta.CLISessionID == "" {
+			continue
+		}
+		dataPath := resolveClaudeProjectJSONL(meta.CLISessionID, meta.OriginCWD, meta.CWD, p.projectsDir)
+		if dataPath == "" {
+			continue
+		}
+		if _, err := os.Stat(dataPath); os.IsNotExist(err) {
+			continue
+		}
+
+		sessions = append(sessions, activeSession{
+			DataPath: dataPath,
+			Source:   "claude-desktop",
+			Identity: &AccountIdentity{
+				AccountUUID:      accountUUID,
+				OrganizationUUID: orgUUID,
+				Tool:             "claude-desktop",
+			},
+		})
+	}
+
+	return sessions
+}
+
+// scanStandaloneCLI finds active CLI sessions not claimed by Desktop.
+func (p *ClaudeParser) scanStandaloneCLI(cutoff time.Time, claimed map[string]bool) []activeSession {
+	files, err := findJSONLFiles(p.projectsDir, p.lookback)
+	if err != nil {
+		return nil
+	}
+
+	// Get identity from statsig cache for standalone CLI sessions
+	home, _ := os.UserHomeDir()
+	identity := readStatsigIdentity(home)
+	if identity != nil {
+		identity.Tool = "claude-code"
+	}
+
+	var sessions []activeSession
+	for _, path := range files {
+		if claimed[path] {
+			continue
+		}
+
+		sessions = append(sessions, activeSession{
+			DataPath: path,
+			Source:   "claude-code",
+			Identity: identity,
+		})
+	}
+
+	return sessions
+}
+
+// ── JSONL Parsing ──────────────────────────────────────────────────────
+
+// parseJSONL reads a Claude JSONL file from the given byte offset.
+// Returns user/assistant records and the new file offset.
+func parseJSONL(path string, offset int64) ([]Record, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, offset, err
 	}
 	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, offset, err
-	}
-	if info.Size() <= offset {
-		return nil, offset, nil
-	}
-
-	// First encounter: skip to end, only collect new data from next run
-	if offset == 0 {
-		return nil, info.Size(), nil
-	}
 
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return nil, offset, err
@@ -130,7 +315,7 @@ func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, ai
 
 	var records []Record
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB line buffer
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -152,7 +337,6 @@ func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, ai
 			continue
 		}
 
-		// Prefer timestamp, fall back to _audit_timestamp (Desktop)
 		ts := cl.Timestamp
 		if ts == "" {
 			ts = cl.AuditTimestamp
@@ -161,11 +345,7 @@ func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, ai
 			ts = time.Now().UTC().Format(time.RFC3339)
 		}
 
-		sessionID := sessionIDPrefix
-		if cl.SessionID != "" && !strings.HasPrefix(sessionIDPrefix, "collector:claude-desktop:") {
-			// For Claude Code, use the sessionId from the JSONL line
-			sessionID = "collector:claude:" + cl.SessionID
-		}
+		sessionID := "collector:claude:" + cl.SessionID
 
 		model := cl.Message.Model
 		if model == "<synthetic>" {
@@ -173,7 +353,6 @@ func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, ai
 		}
 
 		records = append(records, Record{
-			Source:       source,
 			SessionID:    sessionID,
 			Timestamp:    ts,
 			Role:         cl.Message.Role,
@@ -181,13 +360,14 @@ func ParseClaudeJSONLFile(path string, offset int64, source, sessionIDPrefix, ai
 			Model:        model,
 			InputTokens:  cl.Message.Usage.InputTokens,
 			OutputTokens: cl.Message.Usage.OutputTokens,
-			AIVendor:     aiVendor,
 		})
 	}
 
 	newOffset, _ := f.Seek(0, io.SeekCurrent)
 	return records, newOffset, scanner.Err()
 }
+
+// ── Helpers ────────────────────────────────────────────────────────────
 
 // ExtractContent handles both string (user) and array (assistant) content formats.
 func ExtractContent(raw json.RawMessage) string {
@@ -217,19 +397,44 @@ func ExtractContent(raw json.RawMessage) string {
 	return ""
 }
 
-// restoreOffsets extracts the file_offsets map from previous parser state.
 func restoreOffsets(prevState map[string]any) map[string]float64 {
 	offsets := make(map[string]float64)
 	if raw, ok := prevState["file_offsets"]; ok {
-		if m, ok := raw.(map[string]any); ok {
+		switch m := raw.(type) {
+		case map[string]any:
 			for k, v := range m {
 				if f, ok := v.(float64); ok {
 					offsets[k] = f
 				}
 			}
+		case map[string]float64:
+			for k, v := range m {
+				offsets[k] = v
+			}
 		}
 	}
 	return offsets
+}
+
+func restoreKnownFiles(prevState map[string]any) map[string]bool {
+	known := make(map[string]bool)
+	if raw, ok := prevState["known_files"]; ok {
+		switch m := raw.(type) {
+		case map[string]any:
+			for k, v := range m {
+				if b, ok := v.(bool); ok && b {
+					known[k] = true
+				}
+			}
+		case map[string]bool:
+			for k, v := range m {
+				if v {
+					known[k] = true
+				}
+			}
+		}
+	}
+	return known
 }
 
 func findJSONLFiles(baseDir string, lookback time.Duration) ([]string, error) {
@@ -250,4 +455,62 @@ func findJSONLFiles(baseDir string, lookback time.Duration) ([]string, error) {
 		return nil
 	})
 	return files, err
+}
+
+func resolveClaudeProjectJSONL(cliSessionID, originCWD, cwd, projectsDir string) string {
+	filename := cliSessionID + ".jsonl"
+
+	// Try to derive the cwd-hash directory from the working directory.
+	// Claude Code converts "/" to "-" in the path to create the directory name.
+	for _, dir := range []string{originCWD, cwd} {
+		if dir == "" {
+			continue
+		}
+		cwdHash := strings.ReplaceAll(dir, "/", "-")
+		candidate := filepath.Join(projectsDir, cwdHash, filename)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// Fallback: search all project directories
+	dirs, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return ""
+	}
+	for _, d := range dirs {
+		if !d.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(projectsDir, d.Name(), filename)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	return ""
+}
+
+func readDesktopMeta(path string) (*desktopSessionMeta, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var meta desktopSessionMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return nil, err
+	}
+	return &meta, nil
+}
+
+func claudeDesktopAppDir() string {
+	home, _ := os.UserHomeDir()
+	switch runtime.GOOS {
+	case "darwin":
+		return filepath.Join(home, "Library", "Application Support", "Claude")
+	case "windows":
+		return filepath.Join(home, "AppData", "Roaming", "Claude")
+	default:
+		return filepath.Join(home, ".config", "Claude")
+	}
 }

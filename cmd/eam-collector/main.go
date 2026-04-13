@@ -146,22 +146,6 @@ func main() {
 }
 
 func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID string) {
-	// Refresh Desktop→CLI session mapping each cycle so new sessions
-	// created after startup are correctly attributed to Desktop.
-	var desktopParser *parsers.ClaudeDesktopParser
-	var claudeParser *parsers.ClaudeParser
-	for _, p := range pp {
-		if dp, ok := p.(*parsers.ClaudeDesktopParser); ok {
-			desktopParser = dp
-		}
-		if cp, ok := p.(*parsers.ClaudeParser); ok {
-			claudeParser = cp
-		}
-	}
-	if desktopParser != nil && claudeParser != nil {
-		claudeParser.SetDesktopSessionIDs(desktopParser.DesktopSessionCLIIDs())
-	}
-
 	var allRecords []parsers.Record
 	var healths []parsers.Health
 	var parserSummary []string
@@ -389,10 +373,8 @@ func saveSessionIdentities(store *state.Store, entries map[string]sessionIdentit
 
 func createParser(name string) parsers.Parser {
 	switch name {
-	case "claude_code":
+	case "claude", "claude_code", "claude_desktop":
 		return parsers.NewClaudeParser()
-	case "claude_desktop":
-		return parsers.NewClaudeDesktopParser()
 	case "cursor":
 		return parsers.NewCursorParser()
 	case "copilot":
@@ -496,9 +478,7 @@ interval: 60
 lookback: 24
 
 parsers:
-  claude_code:
-    enabled: true
-  claude_desktop:
+  claude:
     enabled: true
   cursor:
     enabled: true
