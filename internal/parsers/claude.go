@@ -460,6 +460,9 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 		identity.Tool = "claude-desktop"
 	}
 
+	// Read the currently selected model from Desktop Local Storage
+	chatModel := readChatModel(p.desktopDir)
+
 	for _, msg := range messages {
 		ts := time.UnixMilli(int64(msg.UpdatedAt)).UTC().Format(time.RFC3339)
 		sessionID := fmt.Sprintf("collector:claude:chat-%d", int64(msg.UpdatedAt)/3600000)
@@ -470,6 +473,7 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 			Timestamp: ts,
 			Role:      "user",
 			Content:   msg.Text,
+			Model:     chatModel,
 			AIVendor:  "Anthropic",
 			Identity:  identity,
 		}
@@ -644,6 +648,80 @@ func restoreLDBSizes(prevState map[string]any) map[string]float64 {
 		}
 	}
 	return sizes
+}
+
+// readChatModel reads the currently selected model from Desktop's Local Storage.
+// The value is stored under key "sticky-model-selector" as e.g. "opus-4-6".
+func readChatModel(desktopDir string) string {
+	lsDir := filepath.Join(desktopDir, "Local Storage", "leveldb")
+	entries, err := os.ReadDir(lsDir)
+	if err != nil {
+		return ""
+	}
+
+	needle := []byte("icky-model-selector") // matches "sticky-model-selector"
+	// Model patterns: opus-4-6, sonnet-4-6, haiku-4-5-20251001, etc.
+	modelPrefixes := []string{"opus-", "sonnet-", "haiku-"}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".ldb") && !strings.HasSuffix(name, ".log") {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(lsDir, name))
+		if err != nil {
+			continue
+		}
+
+		idx := bytesIndex(data, needle)
+		if idx == -1 {
+			continue
+		}
+
+		// Search for model slug near this key (within 100 bytes after)
+		end := idx + 200
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[idx:end]
+
+		// Clean to printable chars
+		clean := make([]byte, 0, len(chunk))
+		for _, b := range chunk {
+			if b >= 32 && b < 127 {
+				clean = append(clean, b)
+			}
+		}
+		s := string(clean)
+
+		// Find model slug (e.g. opus-4-6, sonnet-4-6)
+		for _, prefix := range modelPrefixes {
+			pidx := strings.Index(s, prefix)
+			if pidx == -1 {
+				continue
+			}
+			// Extract the full slug
+			end := pidx
+			for end < len(s) && (s[end] == '-' || (s[end] >= '0' && s[end] <= '9') || (s[end] >= 'a' && s[end] <= 'z')) {
+				end++
+			}
+			slug := s[pidx:end]
+			if len(slug) > 5 {
+				return "claude-" + slug
+			}
+		}
+	}
+	return ""
+}
+
+func bytesIndex(data, needle []byte) int {
+	for i := 0; i <= len(data)-len(needle); i++ {
+		if bytesEqual(data[i:i+len(needle)], needle) {
+			return i
+		}
+	}
+	return -1
 }
 
 func bytesEqual(a, b []byte) bool {
