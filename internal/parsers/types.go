@@ -62,7 +62,10 @@ var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 // Each identity carries a Tool field matching the collector source it
 // governs, so the server can determine governance per-tool independently.
 func ReadClaudeIdentities() []AccountIdentity {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
 
 	var ids []AccountIdentity
 	if id := readStatsigIdentity(home); id != nil {

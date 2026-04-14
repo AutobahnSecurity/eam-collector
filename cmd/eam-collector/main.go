@@ -17,13 +17,20 @@ import (
 	"github.com/AutobahnSecurity/eam-collector/internal/sender"
 	"github.com/AutobahnSecurity/eam-collector/internal/state"
 
-	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
 
 // Set via ldflags at build time
 var (
 	version = "dev"
 	build   = "unknown"
+)
+
+const (
+	// defaultServerURL is the default EAM server for the setup wizard.
+	defaultServerURL = "https://eam.devops.atbhn.io"
+
+	// identityTTL is how long session→identity mappings are kept after last use.
+	identityTTL = 7 * 24 * time.Hour
 )
 
 func main() {
@@ -74,8 +81,11 @@ func main() {
 	log.Printf("[config] Server: %s", cfg.Server.URL)
 	log.Printf("[config] Interval: %ds", cfg.Interval)
 
-	// Initialize sender
-	s := sender.New(cfg.Server.URL, cfg.Server.APIKey)
+	// Initialize sender (validates URL scheme)
+	s, err := sender.New(cfg.Server.URL, cfg.Server.APIKey)
+	if err != nil {
+		log.Fatalf("[sender] %v", err)
+	}
 	if err := s.Ping(); err != nil {
 		log.Printf("[warn] Server ping failed: %v (will retry on first send)", err)
 	} else {
@@ -83,7 +93,10 @@ func main() {
 	}
 
 	// Initialize state store
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("[error] Cannot resolve home directory: %v", err)
+	}
 	stateStore := state.New(filepath.Join(home, ".eam-collector"))
 	if err := stateStore.Load(); err != nil {
 		if strings.Contains(err.Error(), "already running") {
@@ -92,7 +105,8 @@ func main() {
 		log.Printf("[warn] Failed to load state: %v (starting fresh)", err)
 	}
 
-	// Initialize parsers
+	// Initialize parsers — deduplicate names to prevent double-collection
+	seen := make(map[string]bool)
 	var activeParsers []parsers.Parser
 	for name, pcfg := range cfg.Parsers {
 		if !pcfg.Enabled {
@@ -104,6 +118,11 @@ func main() {
 			log.Printf("[%s] Unknown parser, skipping", name)
 			continue
 		}
+		if seen[p.Name()] {
+			log.Printf("[%s] Duplicate parser (already enabled as %q), skipping", name, p.Name())
+			continue
+		}
+		seen[p.Name()] = true
 		p.SetLookback(cfg.Lookback)
 		activeParsers = append(activeParsers, p)
 		log.Printf("[%s] Enabled", name)
@@ -203,10 +222,6 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		}
 	}
 
-	if len(allRecords) == 0 {
-		return
-	}
-
 	// Per-session identity: snapshot the current account when a session is
 	// first seen. This ensures governance is determined by the account active
 	// at session creation, not the current account (which may have changed).
@@ -245,8 +260,7 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		}
 	}
 
-	// Expire identities not seen for 7 days (handles paused sessions that resume)
-	const identityTTL = 7 * 24 * time.Hour
+	// Expire identities not seen within TTL (handles paused sessions that resume)
 	for sid, entry := range sessionIDs {
 		if time.Since(entry.LastSeen) > identityTTL {
 			delete(sessionIDs, sid)
@@ -282,8 +296,9 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		b.records = append(b.records, r)
 	}
 
-	// Send separate payloads per identity group
-	allOK := true
+	// Send separate payloads per identity group.
+	// Always save state afterward — even if some sends fail, we should
+	// persist parser offsets to avoid re-collecting already-processed data.
 	for _, b := range groups {
 		for _, id := range b.identity {
 			log.Printf("[identity] %s account=%s org=%s (%d records)",
@@ -298,18 +313,14 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		resp, err := s.Send(payload)
 		if err != nil {
 			log.Printf("[sender] Failed: %v", err)
-			allOK = false
 			continue
 		}
 		log.Printf("[sender] Stored %d usage records, %d prompts (%d flagged)",
 			resp.Stored, resp.Prompts, resp.Flagged)
 	}
 
-	// Save state only after all sends succeed
-	if allOK {
-		if err := store.Save(); err != nil {
-			log.Printf("[state] Failed to save: %v", err)
-		}
+	if err := store.Save(); err != nil {
+		log.Printf("[state] Failed to save: %v", err)
 	}
 }
 
@@ -381,8 +392,12 @@ func createParser(name string) parsers.Parser {
 }
 
 func findConfig() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
 	candidates := []string{
-		filepath.Join(homeDir(), ".eam-collector", "config.yaml"),
+		filepath.Join(home, ".eam-collector", "config.yaml"),
 		"/etc/eam-collector/config.yaml",
 	}
 	for _, p := range candidates {
@@ -391,11 +406,6 @@ func findConfig() string {
 		}
 	}
 	return ""
-}
-
-func homeDir() string {
-	h, _ := os.UserHomeDir()
-	return h
 }
 
 // hostnameSuffixes must match normalizeHostname() in classification.ts on the server.
@@ -430,11 +440,11 @@ func setupWizard() {
 	fmt.Println()
 
 	// Server URL
-	fmt.Print("Server URL [https://eam.devops.atbhn.io]: ")
+	fmt.Printf("Server URL [%s]: ", defaultServerURL)
 	scanner.Scan()
 	serverURL := strings.TrimSpace(scanner.Text())
 	if serverURL == "" {
-		serverURL = "https://eam.devops.atbhn.io"
+		serverURL = defaultServerURL
 	}
 
 	// API Key
@@ -447,22 +457,34 @@ func setupWizard() {
 
 	// Test connection
 	fmt.Print("Testing connection... ")
-	s := sender.New(serverURL, apiKey)
+	s, err := sender.New(serverURL, apiKey)
+	if err != nil {
+		fmt.Println("FAILED")
+		log.Fatalf("Invalid server URL: %v", err)
+	}
 	if err := s.Ping(); err != nil {
 		fmt.Println("FAILED")
 		log.Fatalf("Cannot reach server: %v", err)
 	}
 	fmt.Println("OK")
 
-	// Write config
-	configDir := filepath.Join(homeDir(), ".eam-collector")
+	// Write config — escape YAML special characters to prevent injection
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("Cannot resolve home directory: %v", err)
+	}
+	configDir := filepath.Join(home, ".eam-collector")
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		log.Fatalf("Cannot create config directory: %v", err)
 	}
 
+	// Escape double quotes and backslashes for safe YAML double-quoted strings
+	safeURL := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(serverURL)
+	safeKey := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(apiKey)
+
 	configContent := fmt.Sprintf(`server:
-  url: %s
-  api_key: %s
+  url: "%s"
+  api_key: "%s"
 
 interval: 60
 lookback: 24
@@ -470,7 +492,7 @@ lookback: 24
 parsers:
   claude:
     enabled: true
-`, serverURL, apiKey)
+`, safeURL, safeKey)
 
 	configPath := filepath.Join(configDir, "config.yaml")
 	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
@@ -484,4 +506,3 @@ parsers:
 	fmt.Println("  brew services start eam-collector")
 	fmt.Println()
 }
-

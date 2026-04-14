@@ -8,11 +8,11 @@ Runs as a background daemon (launchd on macOS, systemd on Linux). Single binary,
 
 | Tool | Parser | Local Data |
 |------|--------|-----------|
-| Claude Code | `claude_code` | JSONL session files (`~/.claude/projects/`) |
-| Claude Desktop | `claude_desktop` | IndexedDB LevelDB log |
-| Cursor | `cursor` | SQLite database (`state.vscdb`) |
-| GitHub Copilot | `copilot` | JSON chat sessions |
-| Continue.dev | `continuedev` | JSON session files |
+| Claude Code | `claude` | JSONL session files (`~/.claude/projects/`) |
+| Claude Desktop (code/cowork) | `claude` | Desktop session metadata → JSONL |
+| Claude Desktop (chat) | `claude` | tipTap editor snapshots in IndexedDB LevelDB |
+
+The unified `claude` parser handles all Claude surfaces. Legacy config names `claude_code` and `claude_desktop` are accepted as aliases.
 
 ## Quick Start
 
@@ -42,15 +42,7 @@ interval: 60
 lookback: 24
 
 parsers:
-  claude_code:
-    enabled: true
-  claude_desktop:
-    enabled: true
-  cursor:
-    enabled: true
-  copilot:
-    enabled: true
-  continuedev:
+  claude:
     enabled: true
 ```
 
@@ -101,7 +93,7 @@ Environment variables are expanded in config values (e.g., `api_key: ${EAM_API_K
 2. **Read** new/changed session data from local tool files
 3. **Detect** Claude account identity (org UUID from statsig cache)
 4. **Send** records to EAM server `POST /api/ingest` with device ID + identities
-5. **Save** state (file offsets, timestamps) only after successful send
+5. **Save** state (file offsets, timestamps) after each cycle to prevent duplicate sends
 
 ### Lookback Filter
 
@@ -109,20 +101,17 @@ The `lookback` setting limits which files are processed. Only sessions modified 
 
 ### Identity Detection
 
-The collector extracts Claude organization UUIDs from the statsig cache (`~/.claude/statsig/statsig.cached.evaluations*`). This reflects the currently logged-in account only.
+The collector extracts Claude account/organization UUIDs from two sources: the statsig cache (`~/.claude/statsig/`) for standalone CLI sessions, and Desktop session directory paths (`~/Library/Application Support/Claude/*/`) for Desktop sessions. Per-session identity is snapshotted when a session is first seen.
 
 These are sent as `identities[]` in the ingest payload. The EAM server checks if any org UUID matches `GOVERNED_ORG_IDS` to determine governance.
 
 ### State Persistence
 
-State is saved to `~/.eam-collector/state.json` (mode 600) **only after successful send**. If the server is unreachable, state is not updated -- records will be re-sent on the next cycle.
+State is saved to `~/.eam-collector/state.json` (mode 600) after each collection cycle. Parser offsets are always persisted to prevent duplicate record collection, even if some sends fail.
 
 Per-parser state:
-- **Claude Code**: byte offsets per JSONL file
-- **Claude Desktop**: log offset + last timestamp
-- **Cursor**: last processed `createdAt` timestamp + processed bubble keys
-- **Copilot**: file modification times
-- **Continue.dev**: set of processed session IDs
+- **Claude (code/cowork)**: byte offsets per JSONL file, known file set
+- **Claude (chat)**: last processed tipTap timestamp
 
 ## Uninstall
 

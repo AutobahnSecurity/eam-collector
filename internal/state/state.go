@@ -32,6 +32,9 @@ func (s *Store) Load() error {
 	// Acquire file lock to prevent concurrent collector instances.
 	// Retry a few times with short delays — on restart, the old process
 	// may still be exiting when launchd starts the new one.
+	// NOTE: syscall.Flock is Unix-only (darwin/linux). This collector
+	// currently targets macOS (Homebrew). Windows support would need
+	// LockFileEx via golang.org/x/sys/windows or a cross-platform lib.
 	lockPath := s.path + ".lock"
 	var f *os.File
 	for attempt := 0; attempt < 5; attempt++ {

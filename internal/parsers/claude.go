@@ -1,7 +1,7 @@
 package parsers
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,8 +9,37 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
+)
+
+// Parser-level constants
+const (
+	// scannerBufSize is the buffer size for JSONL line scanning.
+	scannerBufSize = 1024 * 1024 // 1 MB
+
+	// maxLDBFileSize caps LevelDB file reads to prevent excessive memory use.
+	maxLDBFileSize = 10 * 1024 * 1024 // 10 MB
+
+	// maxJSONLReadSize caps how much new JSONL data is read per cycle (50 MB).
+	// Prevents unbounded memory use if a file grew massively between cycles.
+	maxJSONLReadSize = 50 * 1024 * 1024
+
+	// tipTapWindowSize is the byte window after a tipTap marker to extract context.
+	tipTapWindowSize = 5000
+
+	// tipTapPreWindow is the byte window before a tipTap marker.
+	tipTapPreWindow = 50
+
+	// minSubmissionLen is the minimum peak text length to consider as a submission.
+	minSubmissionLen = 10
+
+	// shortTextThreshold: text below this after a substantial peak signals submission.
+	shortTextThreshold = 20
+
+	// chatModelSearchWindow is bytes to search after a sticky-model-selector key.
+	chatModelSearchWindow = 200
 )
 
 // ClaudeLine represents a single JSONL line from Claude Code / Desktop audit files.
@@ -62,7 +91,11 @@ type ClaudeParser struct {
 }
 
 func NewClaudeParser() *ClaudeParser {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("[claude] Warning: cannot resolve home directory: %v", err)
+		home = ""
+	}
 	return &ClaudeParser{
 		projectsDir: filepath.Join(home, ".claude", "projects"),
 		desktopDir:  claudeDesktopAppDir(),
@@ -282,7 +315,11 @@ func (p *ClaudeParser) scanStandaloneCLI(cutoff time.Time, claimed map[string]bo
 	}
 
 	// Get identity from statsig cache for standalone CLI sessions
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("[claude] Warning: cannot resolve home directory for CLI identity: %v", err)
+		return nil
+	}
 	identity := readStatsigIdentity(home)
 	if identity != nil {
 		identity.Tool = "claude-code"
@@ -308,6 +345,9 @@ func (p *ClaudeParser) scanStandaloneCLI(cutoff time.Time, claimed map[string]bo
 
 // parseJSONL reads a Claude JSONL file from the given byte offset.
 // Returns user/assistant records and the new file offset.
+//
+// Reads all new data into memory and processes only complete lines (up to
+// the last newline). Incomplete trailing lines are left for the next cycle.
 func parseJSONL(path string, offset int64) ([]Record, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -319,18 +359,32 @@ func parseJSONL(path string, offset int64) ([]Record, int64, error) {
 		return nil, offset, err
 	}
 
-	var records []Record
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+	// Read new data from the offset position, capped to prevent unbounded memory use
+	newData, err := io.ReadAll(io.LimitReader(f, maxJSONLReadSize))
+	if err != nil {
+		return nil, offset, err
+	}
+	if len(newData) == 0 {
+		return nil, offset, nil
+	}
 
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	// Only process complete lines (up to last newline).
+	// Incomplete trailing lines are left for the next cycle.
+	lastNL := bytes.LastIndexByte(newData, '\n')
+	if lastNL == -1 {
+		return nil, offset, nil // no complete lines yet
+	}
+	processable := newData[:lastNL+1]
+
+	var records []Record
+	for _, line := range bytes.Split(processable, []byte{'\n'}) {
 		if len(line) == 0 {
 			continue
 		}
 
 		var cl ClaudeLine
 		if err := json.Unmarshal(line, &cl); err != nil {
+			log.Printf("[claude] Skipping malformed JSONL line in %s: %v", filepath.Base(path), err)
 			continue
 		}
 
@@ -369,8 +423,8 @@ func parseJSONL(path string, offset int64) ([]Record, int64, error) {
 		})
 	}
 
-	newOffset, _ := f.Seek(0, io.SeekCurrent)
-	return records, newOffset, scanner.Err()
+	newOffset := offset + int64(len(processable))
+	return records, newOffset, nil
 }
 
 // ── Chat Mode (tipTap snapshots from IndexedDB) ───────────────────────
@@ -418,12 +472,18 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 			continue
 		}
 
+		// Skip oversized files to prevent excessive memory use
+		if info.Size() > maxLDBFileSize {
+			log.Printf("[claude] Skipping oversized LevelDB file %s (%d bytes)", name, info.Size())
+			continue
+		}
+
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
 
-		extracted := extractTipTapSnapshots(data, 0)
+		extracted := extractTipTapSnapshots(data)
 		snapshots = append(snapshots, extracted...)
 	}
 
@@ -444,14 +504,20 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 	}
 
 	// Sort by timestamp and detect submissions
-	sortSnapshots(snapshots)
+	sort.Slice(snapshots, func(i, j int) bool {
+		return snapshots[i].UpdatedAt < snapshots[j].UpdatedAt
+	})
 	messages := detectSubmissions(snapshots, lastTS)
 
 	var records []Record
 	var maxTS float64
 
 	// Get identity for chat records — prefer Desktop directory path (governed account)
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("[claude] Warning: cannot resolve home directory for chat identity: %v", err)
+		return nil, state
+	}
 	identity := readDesktopIdentity(home)
 	if identity == nil {
 		identity = readStatsigIdentity(home)
@@ -504,28 +570,30 @@ type tipTapSnapshot struct {
 }
 
 // extractTipTapSnapshots extracts tipTap editor snapshots from LevelDB binary data.
-// Starts searching from startOffset to only read new data.
-func extractTipTapSnapshots(data []byte, startOffset int64) []tipTapSnapshot {
+func extractTipTapSnapshots(data []byte) []tipTapSnapshot {
 	needle := []byte("tipTapEditorS")
 	var snapshots []tipTapSnapshot
 
-	for i := int(startOffset); i < len(data)-len(needle); i++ {
-		if !bytesEqual(data[i:i+len(needle)], needle) {
-			continue
+	for i := 0; i < len(data)-len(needle); {
+		// Use bytes.Index for O(n) search instead of byte-by-byte comparison
+		idx := bytes.Index(data[i:], needle)
+		if idx == -1 {
+			break
 		}
+		i += idx // absolute position of this match
 
-		// Extract a chunk around this position
-		start := i - 50
+		// Extract a chunk around this position for parsing
+		start := i - tipTapPreWindow
 		if start < 0 {
 			start = 0
 		}
-		end := i + 1500
+		end := i + tipTapWindowSize
 		if end > len(data) {
 			end = len(data)
 		}
 		chunk := data[start:end]
 
-		// Strip non-printable bytes for regex matching
+		// Strip non-printable bytes for text matching
 		clean := make([]byte, 0, len(chunk))
 		for _, b := range chunk {
 			if b >= 32 && b < 127 {
@@ -534,9 +602,10 @@ func extractTipTapSnapshots(data []byte, startOffset int64) []tipTapSnapshot {
 		}
 		s := string(clean)
 
-		// Extract updatedAt
+		// Extract updatedAt timestamp
 		tsIdx := strings.Index(s, `"updatedAt":`)
 		if tsIdx == -1 {
+			i += len(needle)
 			continue
 		}
 		tsStart := tsIdx + len(`"updatedAt":`)
@@ -545,20 +614,24 @@ func extractTipTapSnapshots(data []byte, startOffset int64) []tipTapSnapshot {
 			tsEnd++
 		}
 		if tsEnd == tsStart {
+			i += len(needle)
 			continue
 		}
-		ts := parseFloat(s[tsStart:tsEnd])
+		ts := parseTimestamp(s[tsStart:tsEnd])
 		if ts == 0 {
+			i += len(needle)
 			continue
 		}
 
-		// Extract text content — format: "text",<binary>:"actual text"}]}
+		// Extract text content
 		text := extractTipTapText(s)
 
 		snapshots = append(snapshots, tipTapSnapshot{
 			Text:      text,
 			UpdatedAt: ts,
 		})
+
+		i += len(needle)
 	}
 
 	return snapshots
@@ -588,9 +661,9 @@ func extractTipTapText(s string) string {
 		return ""
 	}
 
-	// Find the closing quote — careful with escaped quotes
+	// Find the closing quote, handling escaped quotes properly
 	rest := sub[valStart:]
-	valEnd := strings.Index(rest, `"}`)
+	valEnd := findUnescapedQuote(rest)
 	if valEnd == -1 {
 		return ""
 	}
@@ -598,16 +671,22 @@ func extractTipTapText(s string) string {
 	return rest[:valEnd]
 }
 
-func sortSnapshots(snapshots []tipTapSnapshot) {
-	for i := 1; i < len(snapshots); i++ {
-		for j := i; j > 0 && snapshots[j].UpdatedAt < snapshots[j-1].UpdatedAt; j-- {
-			snapshots[j], snapshots[j-1] = snapshots[j-1], snapshots[j]
+// findUnescapedQuote finds the position of the first unescaped `"` in s.
+func findUnescapedQuote(s string) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++ // skip escaped character
+			continue
+		}
+		if s[i] == '"' {
+			return i
 		}
 	}
+	return -1
 }
 
 // detectSubmissions finds submitted messages by looking for text length drops.
-// When the editor text shrinks >70%, the previous peak text was submitted.
+// When the editor text shrinks significantly, the previous peak text was submitted.
 func detectSubmissions(snapshots []tipTapSnapshot, afterTS float64) []tipTapSnapshot {
 	var submitted []tipTapSnapshot
 	var peak tipTapSnapshot // tracks the longest text in the current "typing run"
@@ -620,8 +699,8 @@ func detectSubmissions(snapshots []tipTapSnapshot, afterTS float64) []tipTapSnap
 		}
 
 		// Text got shorter. Is it a significant drop (submission)?
-		// Drop >50% OR new text is very short (< 20 chars) while peak was substantial
-		if len(peak.Text) > 10 && (len(snap.Text) < len(peak.Text)/2 || (len(peak.Text) > 20 && len(snap.Text) < 20)) {
+		// Drop >50% OR new text is very short while peak was substantial
+		if len(peak.Text) > minSubmissionLen && (len(snap.Text) < len(peak.Text)/2 || (len(peak.Text) > shortTextThreshold && len(snap.Text) < shortTextThreshold)) {
 			// Only emit if the shrink happens after afterTS
 			if snap.UpdatedAt > afterTS {
 				peak.SubmittedAt = snap.UpdatedAt
@@ -637,25 +716,6 @@ func detectSubmissions(snapshots []tipTapSnapshot, afterTS float64) []tipTapSnap
 	return submitted
 }
 
-func restoreLDBSizes(prevState map[string]any) map[string]float64 {
-	sizes := make(map[string]float64)
-	if raw, ok := prevState["chat_ldb_sizes"]; ok {
-		switch m := raw.(type) {
-		case map[string]any:
-			for k, v := range m {
-				if f, ok := v.(float64); ok {
-					sizes[k] = f
-				}
-			}
-		case map[string]float64:
-			for k, v := range m {
-				sizes[k] = v
-			}
-		}
-	}
-	return sizes
-}
-
 // readChatModel reads the currently selected model from Desktop's Local Storage.
 // The value is stored under key "sticky-model-selector" as e.g. "opus-4-6".
 func readChatModel(desktopDir string) string {
@@ -666,7 +726,6 @@ func readChatModel(desktopDir string) string {
 	}
 
 	needle := []byte("icky-model-selector") // matches "sticky-model-selector"
-	// Model patterns: opus-4-6, sonnet-4-6, haiku-4-5-20251001, etc.
 	modelPrefixes := []string{"opus-", "sonnet-", "haiku-"}
 
 	for _, entry := range entries {
@@ -675,22 +734,30 @@ func readChatModel(desktopDir string) string {
 			continue
 		}
 
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if info.Size() > maxLDBFileSize {
+			continue
+		}
+
 		data, err := os.ReadFile(filepath.Join(lsDir, name))
 		if err != nil {
 			continue
 		}
 
-		idx := bytesIndex(data, needle)
+		idx := bytes.Index(data, needle)
 		if idx == -1 {
 			continue
 		}
 
-		// Search for model slug near this key (within 100 bytes after)
-		end := idx + 200
-		if end > len(data) {
-			end = len(data)
+		// Search for model slug near this key
+		searchEnd := idx + chatModelSearchWindow
+		if searchEnd > len(data) {
+			searchEnd = len(data)
 		}
-		chunk := data[idx:end]
+		chunk := data[idx:searchEnd]
 
 		// Clean to printable chars
 		clean := make([]byte, 0, len(chunk))
@@ -708,11 +775,11 @@ func readChatModel(desktopDir string) string {
 				continue
 			}
 			// Extract the full slug
-			end := pidx
-			for end < len(s) && (s[end] == '-' || (s[end] >= '0' && s[end] <= '9') || (s[end] >= 'a' && s[end] <= 'z')) {
-				end++
+			slugEnd := pidx
+			for slugEnd < len(s) && (s[slugEnd] == '-' || (s[slugEnd] >= '0' && s[slugEnd] <= '9') || (s[slugEnd] >= 'a' && s[slugEnd] <= 'z')) {
+				slugEnd++
 			}
-			slug := s[pidx:end]
+			slug := s[pidx:slugEnd]
 			if len(slug) > 5 {
 				return "claude-" + slug
 			}
@@ -721,34 +788,27 @@ func readChatModel(desktopDir string) string {
 	return ""
 }
 
-func bytesIndex(data, needle []byte) int {
-	for i := 0; i <= len(data)-len(needle); i++ {
-		if bytesEqual(data[i:i+len(needle)], needle) {
-			return i
-		}
+// parseTimestamp parses a millisecond-epoch timestamp string.
+// Returns 0 for empty, non-numeric, or implausible values.
+// Valid range: 2020-01-01 to 2040-01-01 (ms epoch).
+func parseTimestamp(s string) float64 {
+	if len(s) == 0 {
+		return 0
 	}
-	return -1
-}
-
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-func parseFloat(s string) float64 {
 	var result float64
 	for _, c := range s {
 		if c < '0' || c > '9' {
 			break
 		}
 		result = result*10 + float64(c-'0')
+	}
+	// Plausibility check: must be a 13-digit ms epoch in 2020-2040 range
+	const (
+		minTS = 1577836800000 // 2020-01-01T00:00:00Z
+		maxTS = 2208988800000 // 2040-01-01T00:00:00Z
+	)
+	if result < minTS || result > maxTS {
+		return 0
 	}
 	return result
 }
@@ -890,7 +950,11 @@ func readDesktopMeta(path string) (*desktopSessionMeta, error) {
 }
 
 func claudeDesktopAppDir() string {
-	home, _ := os.UserHomeDir()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Printf("[claude] Warning: cannot resolve home directory for Desktop path: %v", err)
+		return ""
+	}
 	switch runtime.GOOS {
 	case "darwin":
 		return filepath.Join(home, "Library", "Application Support", "Claude")
