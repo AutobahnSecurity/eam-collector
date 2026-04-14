@@ -382,6 +382,13 @@ func parseJSONL(path string, offset int64) ([]Record, int64, error) {
 			continue
 		}
 
+		// Skip lines larger than 1 MB — these are typically assistant responses
+		// with large tool outputs (base64 file content, etc.) that exceed Go 1.25's
+		// internal json scanner buffer and produce "bufio.Scanner: token too long".
+		if len(line) > scannerBufSize {
+			continue
+		}
+
 		var cl ClaudeLine
 		if err := json.Unmarshal(line, &cl); err != nil {
 			log.Printf("[claude] Skipping malformed JSONL line in %s: %v", filepath.Base(path), err)
