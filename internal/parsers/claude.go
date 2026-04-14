@@ -450,9 +450,12 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 	var records []Record
 	var maxTS float64
 
-	// Get identity for chat records
+	// Get identity for chat records — prefer Desktop directory path (governed account)
 	home, _ := os.UserHomeDir()
-	identity := readStatsigIdentity(home)
+	identity := readDesktopIdentity(home)
+	if identity == nil {
+		identity = readStatsigIdentity(home)
+	}
 	if identity != nil {
 		identity.Tool = "claude-desktop"
 	}
