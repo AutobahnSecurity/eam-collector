@@ -375,16 +375,6 @@ func createParser(name string) parsers.Parser {
 	switch name {
 	case "claude", "claude_code", "claude_desktop":
 		return parsers.NewClaudeParser()
-	case "cursor":
-		return parsers.NewCursorParser()
-	case "copilot":
-		return parsers.NewCopilotParser()
-	case "continuedev":
-		return parsers.NewContinueParser()
-	case "opencode":
-		return parsers.NewOpenCodeParser()
-	case "codex":
-		return parsers.NewCodexParser()
 	default:
 		return nil
 	}
@@ -479,16 +469,6 @@ lookback: 24
 
 parsers:
   claude:
-    enabled: true
-  cursor:
-    enabled: true
-  copilot:
-    enabled: true
-  continuedev:
-    enabled: true
-  opencode:
-    enabled: true
-  codex:
     enabled: true
 `, serverURL, apiKey)
 
