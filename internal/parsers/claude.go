@@ -464,8 +464,12 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 	chatModel := readChatModel(p.desktopDir)
 
 	for _, msg := range messages {
-		ts := time.UnixMilli(int64(msg.UpdatedAt)).UTC().Format(time.RFC3339)
-		sessionID := fmt.Sprintf("collector:claude:chat-%d", int64(msg.UpdatedAt)/3600000)
+		submitTS := msg.SubmittedAt
+		if submitTS == 0 {
+			submitTS = msg.UpdatedAt
+		}
+		ts := time.UnixMilli(int64(submitTS)).UTC().Format(time.RFC3339)
+		sessionID := fmt.Sprintf("collector:claude:chat-%d", int64(submitTS)/3600000)
 
 		rec := Record{
 			Source:    "claude-desktop",
@@ -494,8 +498,9 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 }
 
 type tipTapSnapshot struct {
-	Text      string
-	UpdatedAt float64
+	Text        string
+	UpdatedAt   float64
+	SubmittedAt float64 // set by detectSubmissions to the shrink timestamp
 }
 
 // extractTipTapSnapshots extracts tipTap editor snapshots from LevelDB binary data.
@@ -619,6 +624,7 @@ func detectSubmissions(snapshots []tipTapSnapshot, afterTS float64) []tipTapSnap
 		if len(peak.Text) > 10 && (len(snap.Text) < len(peak.Text)/2 || (len(peak.Text) > 20 && len(snap.Text) < 20)) {
 			// Only emit if the shrink happens after afterTS
 			if snap.UpdatedAt > afterTS {
+				peak.SubmittedAt = snap.UpdatedAt
 				submitted = append(submitted, peak)
 			}
 			peak = snap // reset for next message
