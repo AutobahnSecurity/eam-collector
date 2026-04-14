@@ -598,31 +598,30 @@ func sortSnapshots(snapshots []tipTapSnapshot) {
 }
 
 // detectSubmissions finds submitted messages by looking for text length drops.
-// When the editor text shrinks >70%, the previous long text was submitted.
+// When the editor text shrinks >70%, the previous peak text was submitted.
 func detectSubmissions(snapshots []tipTapSnapshot, afterTS float64) []tipTapSnapshot {
 	var submitted []tipTapSnapshot
-	var prevBest tipTapSnapshot // longest text before a shrink
+	var peak tipTapSnapshot // tracks the longest text in the current "typing run"
 
 	for _, snap := range snapshots {
-		if snap.UpdatedAt <= afterTS {
-			// Track the longest text even in old snapshots (for detecting
-			// submissions that happen right after afterTS)
-			if len(snap.Text) > len(prevBest.Text) {
-				prevBest = snap
+		// Update peak if text is growing or same length (typing in progress)
+		if len(snap.Text) >= len(peak.Text) {
+			peak = snap
+			continue
+		}
+
+		// Text got shorter. Is it a significant drop (submission)?
+		// Drop >50% OR new text is very short (< 20 chars) while peak was substantial
+		if len(peak.Text) > 10 && (len(snap.Text) < len(peak.Text)/2 || (len(peak.Text) > 20 && len(snap.Text) < 20)) {
+			// Only emit if the shrink happens after afterTS
+			if snap.UpdatedAt > afterTS {
+				submitted = append(submitted, peak)
 			}
+			peak = snap // reset for next message
 			continue
 		}
 
-		// Detect submission: text shrinks significantly
-		if len(prevBest.Text) > 10 && len(snap.Text) < len(prevBest.Text)*3/10 {
-			submitted = append(submitted, prevBest)
-			prevBest = snap
-			continue
-		}
-
-		if len(snap.Text) > len(prevBest.Text) {
-			prevBest = snap
-		}
+		// Minor shrink (backspace/edit) — keep current peak
 	}
 
 	return submitted
