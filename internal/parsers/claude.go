@@ -394,17 +394,17 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 			lastTS = f
 		}
 	}
-	prevSizes := restoreLDBSizes(prevState)
 	isFirstRun := prevState == nil || prevState["chat_last_ts"] == nil
 
-	// Read .ldb and .log files, only process new/grown ones
+	// Read .ldb and .log files modified within lookback window.
+	// LevelDB doesn't append linearly, so we read entire files and
+	// rely on chat_last_ts to filter already-seen snapshots.
 	entries, err := os.ReadDir(idbDir)
 	if err != nil {
 		return nil, state
 	}
 
 	var snapshots []tipTapSnapshot
-	newSizes := make(map[string]float64)
 
 	for _, entry := range entries {
 		name := entry.Name()
@@ -418,25 +418,14 @@ func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[stri
 			continue
 		}
 
-		currentSize := info.Size()
-		prevSize := int64(prevSizes[name])
-		newSizes[name] = float64(currentSize)
-
-		if currentSize <= prevSize {
-			continue // no new data in this file
-		}
-
-		// Read the file and extract snapshots from new portion
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
 		}
 
-		extracted := extractTipTapSnapshots(data, prevSize)
+		extracted := extractTipTapSnapshots(data, 0)
 		snapshots = append(snapshots, extracted...)
 	}
-
-	state["chat_ldb_sizes"] = newSizes
 
 	if len(snapshots) == 0 || isFirstRun {
 		// First run: just record the current max timestamp
