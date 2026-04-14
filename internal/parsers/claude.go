@@ -3,6 +3,7 @@ package parsers
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -80,15 +81,12 @@ func (p *ClaudeParser) Collect(prevState map[string]any) ([]Record, map[string]a
 	offsets := restoreOffsets(prevState)
 	knownFiles := restoreKnownFiles(prevState)
 
-	sessions := p.findActiveSessions()
-	if len(sessions) == 0 {
-		// Nothing active — carry forward state, no records
-		return nil, prevState, nil
-	}
-
 	var records []Record
 	newOffsets := make(map[string]float64)
 	newKnown := make(map[string]bool)
+
+	// ── Path 1: Code/Cowork sessions (JSONL files) ──
+	sessions := p.findActiveSessions()
 
 	for _, sess := range sessions {
 		path := sess.DataPath
@@ -142,9 +140,17 @@ func (p *ClaudeParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		}
 	}
 
+	// ── Path 2: Chat mode (tipTap editor snapshots in IndexedDB) ──
+	chatRecs, chatState := p.collectChat(prevState)
+	records = append(records, chatRecs...)
+
 	newState := map[string]any{
 		"file_offsets": newOffsets,
 		"known_files":  newKnown,
+	}
+	// Merge chat state
+	for k, v := range chatState {
+		newState[k] = v
 	}
 	return records, newState, nil
 }
@@ -365,6 +371,311 @@ func parseJSONL(path string, offset int64) ([]Record, int64, error) {
 
 	newOffset, _ := f.Seek(0, io.SeekCurrent)
 	return records, newOffset, scanner.Err()
+}
+
+// ── Chat Mode (tipTap snapshots from IndexedDB) ───────────────────────
+
+// collectChat reads user messages from Claude Desktop chat mode.
+// Chat mode stores tipTap editor snapshots in IndexedDB LevelDB.
+// Each keystroke creates a snapshot; when the text shrinks significantly,
+// the previous long text was the submitted message.
+func (p *ClaudeParser) collectChat(prevState map[string]any) ([]Record, map[string]any) {
+	state := make(map[string]any)
+
+	idbDir := filepath.Join(p.desktopDir, "IndexedDB", "https_claude.ai_0.indexeddb.leveldb")
+	if _, err := os.Stat(idbDir); os.IsNotExist(err) {
+		return nil, state
+	}
+
+	// Restore previous chat state
+	var lastTS float64
+	if v, ok := prevState["chat_last_ts"]; ok {
+		if f, ok := v.(float64); ok {
+			lastTS = f
+		}
+	}
+	prevSizes := restoreLDBSizes(prevState)
+	isFirstRun := prevState == nil || prevState["chat_last_ts"] == nil
+
+	// Read .ldb and .log files, only process new/grown ones
+	entries, err := os.ReadDir(idbDir)
+	if err != nil {
+		return nil, state
+	}
+
+	var snapshots []tipTapSnapshot
+	newSizes := make(map[string]float64)
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".ldb") && !strings.HasSuffix(name, ".log") {
+			continue
+		}
+
+		path := filepath.Join(idbDir, name)
+		info, err := entry.Info()
+		if err != nil || time.Since(info.ModTime()) > p.lookback {
+			continue
+		}
+
+		currentSize := info.Size()
+		prevSize := int64(prevSizes[name])
+		newSizes[name] = float64(currentSize)
+
+		if currentSize <= prevSize {
+			continue // no new data in this file
+		}
+
+		// Read the file and extract snapshots from new portion
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		extracted := extractTipTapSnapshots(data, prevSize)
+		snapshots = append(snapshots, extracted...)
+	}
+
+	state["chat_ldb_sizes"] = newSizes
+
+	if len(snapshots) == 0 || isFirstRun {
+		// First run: just record the current max timestamp
+		maxTS := lastTS
+		for _, s := range snapshots {
+			if s.UpdatedAt > maxTS {
+				maxTS = s.UpdatedAt
+			}
+		}
+		if maxTS > lastTS {
+			state["chat_last_ts"] = maxTS
+		} else {
+			state["chat_last_ts"] = lastTS
+		}
+		return nil, state
+	}
+
+	// Sort by timestamp and detect submissions
+	sortSnapshots(snapshots)
+	messages := detectSubmissions(snapshots, lastTS)
+
+	var records []Record
+	var maxTS float64
+
+	// Get identity for chat records
+	home, _ := os.UserHomeDir()
+	identity := readStatsigIdentity(home)
+	if identity != nil {
+		identity.Tool = "claude-desktop"
+	}
+
+	for _, msg := range messages {
+		ts := time.UnixMilli(int64(msg.UpdatedAt)).UTC().Format(time.RFC3339)
+		sessionID := fmt.Sprintf("collector:claude:chat-%d", int64(msg.UpdatedAt)/3600000)
+
+		rec := Record{
+			Source:    "claude-desktop",
+			SessionID: sessionID,
+			Timestamp: ts,
+			Role:      "user",
+			Content:   msg.Text,
+			AIVendor:  "Anthropic",
+			Identity:  identity,
+		}
+		records = append(records, rec)
+
+		if msg.UpdatedAt > maxTS {
+			maxTS = msg.UpdatedAt
+		}
+	}
+
+	if maxTS > lastTS {
+		state["chat_last_ts"] = maxTS
+	} else {
+		state["chat_last_ts"] = lastTS
+	}
+
+	return records, state
+}
+
+type tipTapSnapshot struct {
+	Text      string
+	UpdatedAt float64
+}
+
+// extractTipTapSnapshots extracts tipTap editor snapshots from LevelDB binary data.
+// Starts searching from startOffset to only read new data.
+func extractTipTapSnapshots(data []byte, startOffset int64) []tipTapSnapshot {
+	needle := []byte("tipTapEditorS")
+	var snapshots []tipTapSnapshot
+
+	for i := int(startOffset); i < len(data)-len(needle); i++ {
+		if !bytesEqual(data[i:i+len(needle)], needle) {
+			continue
+		}
+
+		// Extract a chunk around this position
+		start := i - 50
+		if start < 0 {
+			start = 0
+		}
+		end := i + 1500
+		if end > len(data) {
+			end = len(data)
+		}
+		chunk := data[start:end]
+
+		// Strip non-printable bytes for regex matching
+		clean := make([]byte, 0, len(chunk))
+		for _, b := range chunk {
+			if b >= 32 && b < 127 {
+				clean = append(clean, b)
+			}
+		}
+		s := string(clean)
+
+		// Extract updatedAt
+		tsIdx := strings.Index(s, `"updatedAt":`)
+		if tsIdx == -1 {
+			continue
+		}
+		tsStart := tsIdx + len(`"updatedAt":`)
+		tsEnd := tsStart
+		for tsEnd < len(s) && s[tsEnd] >= '0' && s[tsEnd] <= '9' {
+			tsEnd++
+		}
+		if tsEnd == tsStart {
+			continue
+		}
+		ts := parseFloat(s[tsStart:tsEnd])
+		if ts == 0 {
+			continue
+		}
+
+		// Extract text content — format: "text",<binary>:"actual text"}]}
+		text := extractTipTapText(s)
+
+		snapshots = append(snapshots, tipTapSnapshot{
+			Text:      text,
+			UpdatedAt: ts,
+		})
+	}
+
+	return snapshots
+}
+
+// extractTipTapText extracts the message text from a cleaned tipTap snapshot string.
+func extractTipTapText(s string) string {
+	// Find the text field value — it appears as: text",...:"actual content here"}]}
+	textIdx := strings.Index(s, `text",`)
+	if textIdx == -1 {
+		textIdx = strings.Index(s, `"text"`)
+		if textIdx == -1 {
+			return ""
+		}
+	}
+
+	// Find the colon-quote that starts the value
+	sub := s[textIdx:]
+	valStart := -1
+	for i := 0; i < len(sub)-1; i++ {
+		if sub[i] == ':' && sub[i+1] == '"' {
+			valStart = i + 2
+			break
+		}
+	}
+	if valStart == -1 {
+		return ""
+	}
+
+	// Find the closing quote — careful with escaped quotes
+	rest := sub[valStart:]
+	valEnd := strings.Index(rest, `"}`)
+	if valEnd == -1 {
+		return ""
+	}
+
+	return rest[:valEnd]
+}
+
+func sortSnapshots(snapshots []tipTapSnapshot) {
+	for i := 1; i < len(snapshots); i++ {
+		for j := i; j > 0 && snapshots[j].UpdatedAt < snapshots[j-1].UpdatedAt; j-- {
+			snapshots[j], snapshots[j-1] = snapshots[j-1], snapshots[j]
+		}
+	}
+}
+
+// detectSubmissions finds submitted messages by looking for text length drops.
+// When the editor text shrinks >70%, the previous long text was submitted.
+func detectSubmissions(snapshots []tipTapSnapshot, afterTS float64) []tipTapSnapshot {
+	var submitted []tipTapSnapshot
+	var prevBest tipTapSnapshot // longest text before a shrink
+
+	for _, snap := range snapshots {
+		if snap.UpdatedAt <= afterTS {
+			// Track the longest text even in old snapshots (for detecting
+			// submissions that happen right after afterTS)
+			if len(snap.Text) > len(prevBest.Text) {
+				prevBest = snap
+			}
+			continue
+		}
+
+		// Detect submission: text shrinks significantly
+		if len(prevBest.Text) > 10 && len(snap.Text) < len(prevBest.Text)*3/10 {
+			submitted = append(submitted, prevBest)
+			prevBest = snap
+			continue
+		}
+
+		if len(snap.Text) > len(prevBest.Text) {
+			prevBest = snap
+		}
+	}
+
+	return submitted
+}
+
+func restoreLDBSizes(prevState map[string]any) map[string]float64 {
+	sizes := make(map[string]float64)
+	if raw, ok := prevState["chat_ldb_sizes"]; ok {
+		switch m := raw.(type) {
+		case map[string]any:
+			for k, v := range m {
+				if f, ok := v.(float64); ok {
+					sizes[k] = f
+				}
+			}
+		case map[string]float64:
+			for k, v := range m {
+				sizes[k] = v
+			}
+		}
+	}
+	return sizes
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func parseFloat(s string) float64 {
+	var result float64
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			break
+		}
+		result = result*10 + float64(c-'0')
+	}
+	return result
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
