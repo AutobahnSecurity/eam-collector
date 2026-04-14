@@ -386,6 +386,7 @@ func parseJSONL(path string, offset int64) ([]Record, int64, error) {
 		// with large tool outputs (base64 file content, etc.) that exceed Go 1.25's
 		// internal json scanner buffer and produce "bufio.Scanner: token too long".
 		if len(line) > scannerBufSize {
+			log.Printf("[claude] Skipping oversized JSONL line (%d bytes) in %s", len(line), filepath.Base(path))
 			continue
 		}
 
