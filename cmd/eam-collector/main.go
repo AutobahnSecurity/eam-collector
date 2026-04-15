@@ -105,13 +105,22 @@ func main() {
 	ticker := time.NewTicker(time.Duration(cfg.Interval) * time.Second)
 	defer ticker.Stop()
 
+	// Read billing data on startup (refreshed hourly)
+	billingData := parsers.ReadBillingData()
+	lastBillingCheck := time.Now()
+
 	// Run immediately on startup
-	collect(activeParsers, s, stateStore, deviceID, identities)
+	collect(activeParsers, s, stateStore, deviceID, identities, billingData)
 
 	for {
 		select {
 		case <-ticker.C:
-			collect(activeParsers, s, stateStore, deviceID, identities)
+			// Refresh billing data hourly
+			if time.Since(lastBillingCheck) > time.Hour {
+				billingData = parsers.ReadBillingData()
+				lastBillingCheck = time.Now()
+			}
+			collect(activeParsers, s, stateStore, deviceID, identities, billingData)
 		case sig := <-sigCh:
 			log.Printf("Received %s, shutting down", sig)
 			_ = stateStore.Save()
@@ -121,7 +130,7 @@ func main() {
 	}
 }
 
-func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID string, identities []parsers.AccountIdentity) {
+func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID string, identities []parsers.AccountIdentity, billingData []parsers.BillingData) {
 	var allRecords []parsers.Record
 
 	for _, p := range pp {
@@ -146,9 +155,10 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 	ids := make([]parsers.AccountIdentity, len(identities))
 	copy(ids, identities)
 	payload := sender.Payload{
-		DeviceID:   deviceID,
-		Records:    allRecords,
-		Identities: ids,
+		DeviceID:    deviceID,
+		Records:     allRecords,
+		Identities:  ids,
+		BillingData: billingData,
 	}
 
 	resp, err := s.Send(payload)

@@ -14,10 +14,11 @@ import (
 
 // Payload is the JSON body sent to POST /api/ingest
 type Payload struct {
-	DeviceID   string                    `json:"device_id"`
-	UserEmail  string                    `json:"user_email,omitempty"`
-	Records    []parsers.Record          `json:"records"`
-	Identities []parsers.AccountIdentity `json:"identities,omitempty"`
+	DeviceID    string                    `json:"device_id"`
+	UserEmail   string                    `json:"user_email,omitempty"`
+	Records     []parsers.Record          `json:"records"`
+	Identities  []parsers.AccountIdentity `json:"identities,omitempty"`
+	BillingData []parsers.BillingData     `json:"billing_data,omitempty"`
 }
 
 // Response from the EAM ingest API
