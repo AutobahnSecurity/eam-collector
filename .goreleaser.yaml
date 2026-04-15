@@ -1,0 +1,91 @@
+version: 2
+
+project_name: eam-collector
+
+before:
+  hooks:
+    - go test ./...
+
+builds:
+  - main: ./cmd/eam-collector/
+    binary: eam-collector
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.build={{.ShortCommit}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+    files:
+      - config.example.yaml
+      - install/com.eam.collector.plist
+      - install/eam-collector.service
+      - install/install.sh
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+brews:
+  - name: eam-collector
+    repository:
+      owner: AutobahnSecurity
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/AutobahnSecurity/eam-collector"
+    description: "AI usage collector agent for Enterprise Agent Management"
+    license: "Proprietary"
+    install: |
+      bin.install "eam-collector"
+      (etc/"eam-collector").mkpath
+      etc.install "config.example.yaml" => "eam-collector/config.example.yaml"
+    post_install: |
+      config_dir = Pathname.new("#{Dir.home}/.eam-collector")
+      config_dir.mkpath
+      config_file = config_dir/"config.yaml"
+      unless config_file.exist?
+        cp etc/"eam-collector/config.example.yaml", config_file
+        ohai "Config template created at #{config_file}"
+        ohai "Edit it with your server URL and API key before starting the service"
+      end
+    service: |
+      run [opt_bin/"eam-collector"]
+      keep_alive true
+      log_path var/"log/eam-collector.log"
+      error_log_path var/"log/eam-collector.log"
+    caveats: |
+      To get started:
+
+        1. Edit your config with your EAM server URL and API key:
+           nano ~/.eam-collector/config.yaml
+
+        2. Start the background daemon:
+           brew services start eam-collector
+
+        3. Check logs:
+           tail -f #{var}/log/eam-collector.log
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/eam-collector --version")
+
+release:
+  github:
+    owner: AutobahnSecurity
+    name: eam-collector
+  name_template: "v{{.Version}}"
