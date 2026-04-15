@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strings"
 )
 
@@ -20,6 +22,19 @@ type Record struct {
 	OutputTokens int     `json:"output_tokens,omitempty"`
 	Cost         float64 `json:"cost,omitempty"`
 	AIVendor     string  `json:"ai_vendor"`
+	// Identity is set by parsers that know the account/org from their data source
+	// (e.g., Desktop parser extracts it from the directory path). When set, main.go
+	// uses this instead of the global identity lookup.
+	Identity     *AccountIdentity `json:"-"`
+}
+
+// Health reports the status of a parser after collection.
+type Health struct {
+	Parser   string `json:"parser"`
+	Status   string `json:"status"`    // "ok", "degraded", "error", "not_installed"
+	Records  int    `json:"records"`
+	Error    string `json:"error,omitempty"`
+	DataPath string `json:"data_path,omitempty"`
 }
 
 // Parser collects AI conversation records from a local tool.
@@ -27,6 +42,7 @@ type Parser interface {
 	Name() string
 	SetLookback(hours int) // limit to sessions modified within N hours
 	Collect(state map[string]any) ([]Record, map[string]any, error)
+	DataDir() string // returns the path this parser reads from
 }
 
 // AccountIdentity holds the AI account info extracted from local tool data.
@@ -36,83 +52,29 @@ type AccountIdentity struct {
 	Tool             string `json:"tool"` // "claude-code", "cursor", etc.
 }
 
-// ReadClaudeIdentities extracts all account/org UUID pairs from both:
-// 1. Claude Code's statsig cache (~/.claude/statsig/)
-// 2. Claude Desktop session paths (~/Library/Application Support/Claude/local-agent-mode-sessions/{account}/{org}/)
+// uuidRe validates lowercase UUID format for session directory names.
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// ReadClaudeIdentities returns the CURRENT account identities for
+// Claude Code (from statsig cache) and Claude Desktop (from the most
+// recently modified session directory).
+//
+// Each identity carries a Tool field matching the collector source it
+// governs, so the server can determine governance per-tool independently.
 func ReadClaudeIdentities() []AccountIdentity {
-	home, _ := os.UserHomeDir()
-	seen := map[string]bool{}
-	var identities []AccountIdentity
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
 
-	// Source 1: statsig cache
+	var ids []AccountIdentity
 	if id := readStatsigIdentity(home); id != nil {
-		key := id.AccountUUID + ":" + id.OrganizationUUID
-		if !seen[key] {
-			identities = append(identities, *id)
-			seen[key] = true
-		}
+		ids = append(ids, *id)
 	}
-
-	// Source 2: Claude Desktop session directory structure
-	// Path: local-agent-mode-sessions/{accountUUID}/{orgUUID}/
-	sessionBase := filepath.Join(home, "Library", "Application Support", "Claude", "local-agent-mode-sessions")
-	accounts, err := os.ReadDir(sessionBase)
-	if err == nil {
-		for _, acct := range accounts {
-			if !acct.IsDir() || acct.Name() == "skills-plugin" {
-				continue
-			}
-			acctPath := filepath.Join(sessionBase, acct.Name())
-			orgs, err := os.ReadDir(acctPath)
-			if err != nil {
-				continue
-			}
-			for _, org := range orgs {
-				if !org.IsDir() {
-					continue
-				}
-				key := acct.Name() + ":" + org.Name()
-				if seen[key] {
-					continue
-				}
-				identities = append(identities, AccountIdentity{
-					AccountUUID:      acct.Name(),
-					OrganizationUUID: org.Name(),
-					Tool:             "claude-desktop",
-				})
-				seen[key] = true
-			}
-		}
+	if id := readDesktopIdentity(home); id != nil {
+		ids = append(ids, *id)
 	}
-
-	// Source 3: Linux path
-	linuxBase := filepath.Join(home, ".config", "Claude", "local-agent-mode-sessions")
-	if linuxAccounts, err := os.ReadDir(linuxBase); err == nil {
-		for _, acct := range linuxAccounts {
-			if !acct.IsDir() || acct.Name() == "skills-plugin" {
-				continue
-			}
-			acctPath := filepath.Join(linuxBase, acct.Name())
-			orgs, _ := os.ReadDir(acctPath)
-			for _, org := range orgs {
-				if !org.IsDir() {
-					continue
-				}
-				key := acct.Name() + ":" + org.Name()
-				if seen[key] {
-					continue
-				}
-				identities = append(identities, AccountIdentity{
-					AccountUUID:      acct.Name(),
-					OrganizationUUID: org.Name(),
-					Tool:             "claude-desktop",
-				})
-				seen[key] = true
-			}
-		}
-	}
-
-	return identities
+	return ids
 }
 
 // ReadClaudeIdentity returns the first identity found (backward compat).
@@ -132,9 +94,20 @@ func readStatsigIdentity(home string) *AccountIdentity {
 		return nil
 	}
 
+	// Pick the most recently modified evaluation cache file.
+	// Multiple files may exist for different accounts.
 	var evalFile string
+	var newestMtime int64
 	for _, f := range files {
-		if !f.IsDir() && strings.HasPrefix(f.Name(), "statsig.cached.evaluations") {
+		if f.IsDir() || !strings.HasPrefix(f.Name(), "statsig.cached.evaluations") {
+			continue
+		}
+		info, err := f.Info()
+		if err != nil {
+			continue
+		}
+		if mt := info.ModTime().UnixNano(); mt > newestMtime {
+			newestMtime = mt
 			evalFile = filepath.Join(statsigDir, f.Name())
 		}
 	}
@@ -174,5 +147,85 @@ func readStatsigIdentity(home string) *AccountIdentity {
 		AccountUUID:      inner.EvaluatedKeys.CustomIDs.AccountUUID,
 		OrganizationUUID: inner.EvaluatedKeys.CustomIDs.OrganizationUUID,
 		Tool:             "claude-code",
+	}
+}
+
+// readDesktopIdentity extracts the CURRENT Claude Desktop account identity
+// from the most recently modified session directory.
+//
+// Claude Desktop stores sessions at:
+//   {appDataDir}/local-agent-mode-sessions/{account_uuid}/{org_uuid}/
+//
+// The most recently modified {account}/{org} pair is the active session.
+// Only the single most-recent pair is returned to avoid historical artifacts
+// from previously-used accounts/orgs.
+func readDesktopIdentity(home string) *AccountIdentity {
+	var appDir string
+	switch runtime.GOOS {
+	case "darwin":
+		appDir = filepath.Join(home, "Library", "Application Support", "Claude")
+	case "windows":
+		appDir = filepath.Join(home, "AppData", "Roaming", "Claude")
+	default:
+		appDir = filepath.Join(home, ".config", "Claude")
+	}
+
+	// Check both legacy and current Desktop session directories
+	sessionsDirs := []string{
+		filepath.Join(appDir, "claude-code-sessions"),
+		filepath.Join(appDir, "local-agent-mode-sessions"),
+	}
+
+	var bestAccount, bestOrg string
+	var bestMtime int64
+
+	for _, sessionsDir := range sessionsDirs {
+		accounts, err := os.ReadDir(sessionsDir)
+		if err != nil {
+			continue
+		}
+
+		for _, acctEntry := range accounts {
+			if !acctEntry.IsDir() {
+				continue
+			}
+			acctName := acctEntry.Name()
+			if acctName == "skills-plugin" || !uuidRe.MatchString(acctName) {
+				continue
+			}
+
+			orgs, err := os.ReadDir(filepath.Join(sessionsDir, acctName))
+			if err != nil {
+				continue
+			}
+			for _, orgEntry := range orgs {
+				if !orgEntry.IsDir() {
+					continue
+				}
+				orgName := orgEntry.Name()
+				if !uuidRe.MatchString(orgName) {
+					continue
+				}
+				info, err := orgEntry.Info()
+				if err != nil {
+					continue
+				}
+				if mt := info.ModTime().UnixNano(); mt > bestMtime {
+					bestMtime = mt
+					bestAccount = acctName
+					bestOrg = orgName
+				}
+			}
+		}
+	}
+
+	if bestAccount == "" {
+		return nil
+	}
+
+	return &AccountIdentity{
+		AccountUUID:      bestAccount,
+		OrganizationUUID: bestOrg,
+		Tool:             "claude-desktop",
 	}
 }

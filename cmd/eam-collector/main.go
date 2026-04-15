@@ -170,12 +170,6 @@ func createParser(name string) parsers.Parser {
 	switch name {
 	case "claude", "claude_code":
 		return parsers.NewClaudeParser()
-	case "cursor":
-		return parsers.NewCursorParser()
-	case "copilot":
-		return parsers.NewCopilotParser()
-	case "continuedev":
-		return parsers.NewContinueParser()
 	default:
 		return nil
 	}
