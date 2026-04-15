@@ -1,0 +1,4 @@
+83f7dbee2fa479b5781964a443149d36f768583baccc36fd1a0cce653249b8ab  eam-collector-0.1.2-darwin-amd64.tar.gz
+dbd6470d10db4330f392b101ddb6a32744bdddedc4137c739aa4878b078747be  eam-collector-0.1.2-darwin-arm64.tar.gz
+1a964c2ca0f80cef04ac025142404610dc3af3eb1db3bf880d1d6893c26e6a57  eam-collector-0.1.2-linux-amd64.tar.gz
+360e3316d9c0cfdf8eb4f7d3569ca90aa583aa6126ad9f45015552233e47486a  eam-collector-0.1.2-linux-arm64.tar.gz

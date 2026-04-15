@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
-	"time"
 )
 
 // Store persists per-parser state (file offsets, processed IDs, etc.)
@@ -29,29 +28,15 @@ func (s *Store) Load() error {
 		return err
 	}
 
-	// Acquire file lock to prevent concurrent collector instances.
-	// Retry a few times with short delays — on restart, the old process
-	// may still be exiting when launchd starts the new one.
-	// NOTE: syscall.Flock is Unix-only (darwin/linux). This collector
-	// currently targets macOS (Homebrew). Windows support would need
-	// LockFileEx via golang.org/x/sys/windows or a cross-platform lib.
+	// Acquire file lock to prevent concurrent collector instances
 	lockPath := s.path + ".lock"
-	var f *os.File
-	for attempt := 0; attempt < 5; attempt++ {
-		var err error
-		f, err = os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
-		if err != nil {
-			return fmt.Errorf("open lock file: %w", err)
-		}
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-			f.Close()
-			if attempt < 4 {
-				time.Sleep(time.Duration(attempt+1) * time.Second)
-				continue
-			}
-			return fmt.Errorf("another eam-collector instance is already running (lock: %s)", lockPath)
-		}
-		break
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open lock file: %w", err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return fmt.Errorf("another eam-collector instance is already running (lock: %s)", lockPath)
 	}
 	s.lock = f
 
@@ -87,14 +72,12 @@ func (s *Store) Save() error {
 	return nil
 }
 
-// Close releases the file lock and removes the lock file.
+// Close releases the file lock.
 func (s *Store) Close() {
 	if s.lock != nil {
-		lockPath := s.lock.Name()
 		syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
 		s.lock.Close()
 		s.lock = nil
-		os.Remove(lockPath)
 	}
 }
 
