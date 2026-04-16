@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -13,15 +14,66 @@ import (
 
 	"github.com/AutobahnSecurity/eam-collector/internal/config"
 	"github.com/AutobahnSecurity/eam-collector/internal/parsers"
+	"github.com/AutobahnSecurity/eam-collector/internal/platform"
 	"github.com/AutobahnSecurity/eam-collector/internal/sender"
 	"github.com/AutobahnSecurity/eam-collector/internal/state"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver
 )
 
+// Collector orchestrates the collection and sending of AI usage records.
+type Collector struct {
+	Parsers     []parsers.Parser
+	Sender      *sender.Sender
+	State       *state.Store
+	DeviceID    string
+	Identities  []parsers.AccountIdentity
+	BillingData []parsers.BillingData
+}
+
 func main() {
 	configPath := flag.String("config", "", "Path to config.yaml")
+	stopFlag := flag.Bool("stop", false, "Stop the running collector")
+	statusFlag := flag.Bool("status", false, "Check if the collector is running")
 	flag.Parse()
+
+	// Handle --stop and --status before anything else
+	if *stopFlag || *statusFlag {
+		home, err := platform.HomeDir()
+		if err != nil {
+			log.Fatalf("Cannot resolve home directory: %v", err)
+		}
+		lockPath := filepath.Join(home, ".eam-collector", "state.json.lock")
+		pid := state.ReadPID(lockPath)
+
+		if *statusFlag {
+			if pid > 0 && processAlive(pid) {
+				fmt.Printf("eam-collector is running (PID %d)\n", pid)
+			} else {
+				fmt.Println("eam-collector is not running")
+			}
+			return
+		}
+
+		// --stop
+		if pid == 0 {
+			fmt.Println("eam-collector is not running (no PID in lock file)")
+			return
+		}
+		if !processAlive(pid) {
+			fmt.Printf("eam-collector is not running (stale PID %d)\n", pid)
+			return
+		}
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			log.Fatalf("Cannot find process %d: %v", pid, err)
+		}
+		if err := proc.Signal(syscall.SIGTERM); err != nil {
+			log.Fatalf("Cannot stop collector (PID %d): %v", pid, err)
+		}
+		fmt.Printf("Sent SIGTERM to eam-collector (PID %d)\n", pid)
+		return
+	}
 
 	// Find config file
 	cfgPath := *configPath
@@ -44,7 +96,10 @@ func main() {
 	log.Printf("[config] Interval: %ds", cfg.Interval)
 
 	// Initialize sender
-	s := sender.New(cfg.Server.URL, cfg.Server.APIKey)
+	s, err := sender.New(cfg.Server.URL, cfg.Server.APIKey)
+	if err != nil {
+		log.Fatalf("Failed to initialize sender: %v", err)
+	}
 	if err := s.Ping(); err != nil {
 		log.Printf("[warn] Server ping failed: %v (will retry on first send)", err)
 	} else {
@@ -52,7 +107,10 @@ func main() {
 	}
 
 	// Initialize state store
-	home, _ := os.UserHomeDir()
+	home, err := platform.HomeDir()
+	if err != nil {
+		log.Fatalf("Cannot resolve home directory: %v", err)
+	}
 	stateStore := state.New(filepath.Join(home, ".eam-collector"))
 	if err := stateStore.Load(); err != nil {
 		log.Printf("[warn] Failed to load state: %v (starting fresh)", err)
@@ -93,36 +151,44 @@ func main() {
 		log.Println("[identity] No Claude accounts detected")
 	}
 
-	// Graceful shutdown
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// Graceful shutdown via context
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
 
 	fmt.Println()
 	log.Println("Collector running. Press Ctrl+C to stop.")
 	fmt.Println()
 
+	c := &Collector{
+		Parsers:    activeParsers,
+		Sender:     s,
+		State:      stateStore,
+		DeviceID:   deviceID,
+		Identities: identities,
+	}
+
+	// Read billing data on startup (refreshed hourly)
+	c.BillingData = parsers.ReadBillingData()
+	lastBillingCheck := time.Now()
+
 	// Main loop
 	ticker := time.NewTicker(time.Duration(cfg.Interval) * time.Second)
 	defer ticker.Stop()
 
-	// Read billing data on startup (refreshed hourly)
-	billingData := parsers.ReadBillingData()
-	lastBillingCheck := time.Now()
-
 	// Run immediately on startup
-	collect(activeParsers, s, stateStore, deviceID, identities, billingData)
+	c.collect(ctx)
 
 	for {
 		select {
 		case <-ticker.C:
 			// Refresh billing data hourly
 			if time.Since(lastBillingCheck) > time.Hour {
-				billingData = parsers.ReadBillingData()
+				c.BillingData = parsers.ReadBillingData()
 				lastBillingCheck = time.Now()
 			}
-			collect(activeParsers, s, stateStore, deviceID, identities, billingData)
-		case sig := <-sigCh:
-			log.Printf("Received %s, shutting down", sig)
+			c.collect(ctx)
+		case <-ctx.Done():
+			log.Println("Shutting down")
 			_ = stateStore.Save()
 			stateStore.Close()
 			return
@@ -130,11 +196,11 @@ func main() {
 	}
 }
 
-func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID string, identities []parsers.AccountIdentity, billingData []parsers.BillingData) {
+func (c *Collector) collect(ctx context.Context) {
 	var allRecords []parsers.Record
 
-	for _, p := range pp {
-		prevState := store.Get(p.Name())
+	for _, p := range c.Parsers {
+		prevState := c.State.Get(p.Name())
 		records, newState, err := p.Collect(prevState)
 		if err != nil {
 			log.Printf("[%s] Error: %v", p.Name(), err)
@@ -144,24 +210,21 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 			log.Printf("[%s] Collected %d records", p.Name(), len(records))
 			allRecords = append(allRecords, records...)
 		}
-		store.Set(p.Name(), newState)
+		c.State.Set(p.Name(), newState)
 	}
 
 	if len(allRecords) == 0 {
 		return
 	}
 
-	// Send to EAM server — no user_email, resolved from MDE on server side
-	ids := make([]parsers.AccountIdentity, len(identities))
-	copy(ids, identities)
 	payload := sender.Payload{
-		DeviceID:    deviceID,
+		DeviceID:    c.DeviceID,
 		Records:     allRecords,
-		Identities:  ids,
-		BillingData: billingData,
+		Identities:  c.Identities,
+		BillingData: c.BillingData,
 	}
 
-	resp, err := s.Send(payload)
+	resp, err := c.Sender.Send(ctx, payload)
 	if err != nil {
 		log.Printf("[sender] Failed: %v", err)
 		return
@@ -171,7 +234,7 @@ func collect(pp []parsers.Parser, s *sender.Sender, store *state.Store, deviceID
 		resp.Stored, resp.Prompts, resp.Flagged)
 
 	// Save state only after successful send
-	if err := store.Save(); err != nil {
+	if err := c.State.Save(); err != nil {
 		log.Printf("[state] Failed to save: %v", err)
 	}
 }
@@ -180,14 +243,24 @@ func createParser(name string) parsers.Parser {
 	switch name {
 	case "claude", "claude_code":
 		return parsers.NewClaudeParser()
+	case "cursor":
+		return parsers.NewCursorParser()
+	case "copilot":
+		return parsers.NewCopilotParser()
+	case "continuedev":
+		return parsers.NewContinueParser()
 	default:
 		return nil
 	}
 }
 
 func findConfig() string {
+	home, err := platform.HomeDir()
+	if err != nil {
+		home = ""
+	}
 	candidates := []string{
-		filepath.Join(homeDir(), ".eam-collector", "config.yaml"),
+		filepath.Join(home, ".eam-collector", "config.yaml"),
 		"/etc/eam-collector/config.yaml",
 	}
 	for _, p := range candidates {
@@ -198,9 +271,14 @@ func findConfig() string {
 	return ""
 }
 
-func homeDir() string {
-	h, _ := os.UserHomeDir()
-	return h
+// processAlive checks whether a process with the given PID is still running.
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	// On Unix, Signal(0) checks if process exists without actually signaling it
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 func hostname() string {
@@ -208,9 +286,7 @@ func hostname() string {
 	if err != nil {
 		return "unknown"
 	}
-	// Normalize: lowercase, strip .local suffix to match MDE device names
 	h = strings.ToLower(h)
 	h = strings.TrimSuffix(h, ".local")
 	return h
 }
-

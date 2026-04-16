@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"log"
+	"net/url"
 	"os"
 
 	"gopkg.in/yaml.v3"
@@ -43,11 +45,26 @@ func Load(path string) (*Config, error) {
 	if cfg.Server.URL == "" {
 		return nil, fmt.Errorf("server.url is required")
 	}
+	u, err := url.Parse(cfg.Server.URL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid server.url %q: %w", cfg.Server.URL, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("server.url must use http:// or https:// scheme, got %q", cfg.Server.URL)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("server.url must include a hostname, got %q", cfg.Server.URL)
+	}
 	if cfg.Server.APIKey == "" {
 		return nil, fmt.Errorf("server.api_key is required")
 	}
 	if cfg.Interval < 10 {
+		log.Printf("[config] Warning: interval %d too low, clamped to 10s", cfg.Interval)
 		cfg.Interval = 10
+	}
+	if cfg.Interval > 3600 {
+		log.Printf("[config] Warning: interval %d too high, clamped to 3600s", cfg.Interval)
+		cfg.Interval = 3600
 	}
 	if cfg.Lookback <= 0 {
 		cfg.Lookback = 24 // default: only sessions from last 24 hours

@@ -8,12 +8,17 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/AutobahnSecurity/eam-collector/internal/platform"
 	"github.com/klauspost/compress/zstd"
 )
+
+// billingLDBSearchWindow is the byte window around an org UUID to search for billing_type.
+// This is a heuristic based on the observed format of Claude Desktop's Local Storage.
+const billingLDBSearchWindow = 500
 
 // BillingData holds subscription/billing info extracted from Claude Desktop's local cache.
 type BillingData struct {
@@ -40,7 +45,11 @@ var (
 // ReadBillingData extracts subscription/billing info from Claude Desktop's HTTP cache.
 // Reads zstd-compressed API responses cached by the Electron app.
 func ReadBillingData() []BillingData {
-	cacheDir := claudeDesktopCacheDir()
+	home, err := platform.HomeDir()
+	if err != nil {
+		return nil
+	}
+	cacheDir := platform.ClaudeDesktopCacheDir(home)
 	if cacheDir == "" {
 		return nil
 	}
@@ -135,6 +144,30 @@ func ReadBillingData() []BillingData {
 	return results
 }
 
+// zstdDecoder is a lazily initialized, reusable zstd decoder.
+// Using sync.Once instead of sync.Pool to avoid the stale-state pitfall:
+// sync.Pool items can hold references to previously decoded buffers,
+// and zstd.Decoder.Reset(nil) is needed between uses to release them.
+// A single shared decoder with a mutex is simpler and correct for our
+// use case (billing data decoded once per hour, not a hot path).
+var (
+	zstdDecoder     *zstd.Decoder
+	zstdDecoderOnce sync.Once
+	zstdDecoderMu   sync.Mutex
+)
+
+func getZstdDecoder() *zstd.Decoder {
+	zstdDecoderOnce.Do(func() {
+		dec, err := zstd.NewReader(nil)
+		if err != nil {
+			log.Printf("[billing] Failed to create zstd decoder: %v", err)
+			return
+		}
+		zstdDecoder = dec
+	})
+	return zstdDecoder
+}
+
 // decompressZstdBody finds and decompresses zstd content in a cache entry.
 func decompressZstdBody(data []byte) string {
 	// Find zstd magic bytes: 0x28 0xB5 0x2F 0xFD
@@ -143,16 +176,21 @@ func decompressZstdBody(data []byte) string {
 		return ""
 	}
 
-	// Create decoder per-call (avoids init ordering issues)
-	dec, err := zstd.NewReader(nil)
-	if err != nil {
+	dec := getZstdDecoder()
+	if dec == nil {
 		return ""
 	}
-	defer dec.Close()
+
+	zstdDecoderMu.Lock()
+	defer zstdDecoderMu.Unlock()
 
 	// DecodeAll may return both decoded data AND an error when there's
 	// trailing garbage after the zstd frame. Accept the result if we got data.
-	decoded, _ := dec.DecodeAll(data[idx:], nil)
+	decoded, err := dec.DecodeAll(data[idx:], nil)
+	if err != nil && len(decoded) == 0 {
+		log.Printf("[billing] zstd decompression failed: %v", err)
+		return ""
+	}
 	if len(decoded) > 0 {
 		return string(decoded)
 	}
@@ -237,7 +275,11 @@ func parseMembersCount(body string, bd *BillingData) {
 
 // readBillingTypeFromLDB reads billing_type and plan from Local Storage LevelDB.
 func readBillingTypeFromLDB(orgData map[string]*BillingData) {
-	ldbDir := claudeDesktopLDBDir()
+	home, err := platform.HomeDir()
+	if err != nil {
+		return
+	}
+	ldbDir := platform.ClaudeDesktopLDBDir(home)
 	if ldbDir == "" {
 		return
 	}
@@ -268,7 +310,7 @@ func readBillingTypeFromLDB(orgData map[string]*BillingData) {
 
 			// Search in a window around the org UUID
 			start := idx
-			end := idx + 500
+			end := idx + billingLDBSearchWindow
 			if end > len(text) {
 				end = len(text)
 			}
@@ -278,9 +320,10 @@ func readBillingTypeFromLDB(orgData map[string]*BillingData) {
 				orgData[orgUUID].BillingType = m[1]
 			}
 
-			// Look for plan type
+			// Look for plan type. "raven" is the internal codename for the
+			// Claude Team/Enterprise plan (distinguished by "commercial_use" billing).
 			if strings.Contains(window, "commercial_use") {
-				orgData[orgUUID].Plan = "raven" // Team/Enterprise
+				orgData[orgUUID].Plan = "raven"
 			} else if strings.Contains(window, `"pro"`) || strings.Contains(window, "_pro") {
 				orgData[orgUUID].Plan = "claude_pro"
 			}
@@ -289,49 +332,13 @@ func readBillingTypeFromLDB(orgData map[string]*BillingData) {
 }
 
 // extractJSON extracts a JSON object starting at the given position.
+// Uses json.Decoder to correctly handle braces inside string values.
 func extractJSON(s string, start int) string {
-	depth := 0
-	for i := start; i < len(s); i++ {
-		if s[i] == '{' {
-			depth++
-		} else if s[i] == '}' {
-			depth--
-			if depth == 0 {
-				return s[start : i+1]
-			}
-		}
+	dec := json.NewDecoder(strings.NewReader(s[start:]))
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return ""
 	}
-	return ""
+	return string(raw)
 }
 
-// claudeDesktopCacheDir returns the Chrome cache directory for Claude Desktop.
-func claudeDesktopCacheDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "Claude", "Cache", "Cache_Data")
-	case "linux":
-		return filepath.Join(home, ".config", "Claude", "Cache", "Cache_Data")
-	default:
-		return ""
-	}
-}
-
-// claudeDesktopLDBDir returns the Local Storage LevelDB directory for Claude Desktop.
-func claudeDesktopLDBDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "Claude", "Local Storage", "leveldb")
-	case "linux":
-		return filepath.Join(home, ".config", "Claude", "Local Storage", "leveldb")
-	default:
-		return ""
-	}
-}

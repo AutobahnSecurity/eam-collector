@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
+
+	"github.com/AutobahnSecurity/eam-collector/internal/platform"
 )
 
 type CursorParser struct {
@@ -18,8 +18,13 @@ type CursorParser struct {
 }
 
 func NewCursorParser() *CursorParser {
+	home, err := platform.HomeDir()
+	if err != nil {
+		log.Printf("[cursor] Warning: %v", err)
+		home = ""
+	}
 	return &CursorParser{
-		dbPath:   cursorDBPath(),
+		dbPath:   platform.CursorDBPath(home),
 		lookback: 24 * time.Hour,
 	}
 }
@@ -79,7 +84,9 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		composerID := strings.TrimPrefix(key, "composerData:")
 		var createdAt float64
 		if v, ok := raw["createdAt"]; ok {
-			json.Unmarshal(v, &createdAt)
+			if err := json.Unmarshal(v, &createdAt); err != nil {
+				log.Printf("[cursor] Cannot parse createdAt for %s: %v", composerID, err)
+			}
 		}
 		if createdAt <= lastTS {
 			continue
@@ -92,24 +99,31 @@ func (p *CursorParser) Collect(prevState map[string]any) ([]Record, map[string]a
 		ts := time.UnixMilli(int64(createdAt)).UTC().Format(time.RFC3339)
 		sessionID := fmt.Sprintf("collector:cursor:%s", composerID)
 
-		// Try to extract from inline conversation (v14+)
+		// Try to extract from inline conversation (v14+).
+		// Only fall back to text field if conversation is absent or empty,
+		// to avoid double-emitting when both fields coexist during upgrades.
+		var extracted bool
 		if convRaw, ok := raw["conversation"]; ok {
 			recs := p.parseConversation(convRaw, sessionID, ts)
-			records = append(records, recs...)
+			if len(recs) > 0 {
+				records = append(records, recs...)
+				extracted = true
+			}
 		}
 
-		// Try to extract from inline text (v1 with embedded conversation)
-		if textRaw, ok := raw["text"]; ok {
-			var text string
-			if json.Unmarshal(textRaw, &text) == nil && text != "" {
-				records = append(records, Record{
-					Source:    "cursor",
-					SessionID: sessionID,
-					Timestamp: ts,
-					Role:      "user",
-					Content:   text,
-					AIVendor:  "Cursor",
-				})
+		if !extracted {
+			if textRaw, ok := raw["text"]; ok {
+				var text string
+				if json.Unmarshal(textRaw, &text) == nil && text != "" {
+					records = append(records, Record{
+						Source:    "cursor",
+						SessionID: sessionID,
+						Timestamp: ts,
+						Role:      "user",
+						Content:   text,
+						AIVendor:  "Cursor",
+					})
+				}
 			}
 		}
 
@@ -231,10 +245,19 @@ func (p *CursorParser) readBubbles(db *sql.DB, processed map[string]bool) ([]Rec
 			role = "assistant"
 		}
 
+		// Use DB file mtime as best-effort timestamp for old-format bubbles
+		// that lack per-message timestamps.
+		var bubbleTS string
+		if info, err := os.Stat(p.dbPath); err == nil {
+			bubbleTS = info.ModTime().UTC().Format(time.RFC3339)
+		} else {
+			bubbleTS = time.Now().UTC().Format(time.RFC3339)
+		}
+
 		records = append(records, Record{
 			Source:    "cursor",
 			SessionID: fmt.Sprintf("collector:cursor:%s", composerID),
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Timestamp: bubbleTS,
 			Role:      role,
 			Content:   bubble.Text,
 			AIVendor:  "Cursor",
@@ -245,14 +268,3 @@ func (p *CursorParser) readBubbles(db *sql.DB, processed map[string]bool) ([]Rec
 	return records, newKeys, rows.Err()
 }
 
-func cursorDBPath() string {
-	home, _ := os.UserHomeDir()
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "Cursor", "User", "globalStorage", "state.vscdb")
-	case "windows":
-		return filepath.Join(home, "AppData", "Roaming", "Cursor", "User", "globalStorage", "state.vscdb")
-	default:
-		return filepath.Join(home, ".config", "Cursor", "User", "globalStorage", "state.vscdb")
-	}
-}

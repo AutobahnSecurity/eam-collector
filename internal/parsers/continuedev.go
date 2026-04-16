@@ -3,9 +3,13 @@ package parsers
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
+
+	"github.com/AutobahnSecurity/eam-collector/internal/platform"
 )
 
 type continueSession struct {
@@ -19,11 +23,6 @@ type continueSession struct {
 	} `json:"history"`
 }
 
-type continueIndex struct {
-	SessionID  string `json:"sessionId"`
-	Title      string `json:"title"`
-}
-
 type ContinueParser struct {
 	baseDir  string
 	lookback time.Duration
@@ -34,9 +33,13 @@ func (p *ContinueParser) SetLookback(hours int) {
 }
 
 func NewContinueParser() *ContinueParser {
-	home, _ := os.UserHomeDir()
+	home, err := platform.HomeDir()
+	if err != nil {
+		log.Printf("[continuedev] Warning: %v", err)
+		home = ""
+	}
 	return &ContinueParser{
-		baseDir: filepath.Join(home, ".continue", "sessions"),
+		baseDir: platform.ContinueSessionsDir(home),
 	}
 }
 
@@ -78,6 +81,12 @@ func (p *ContinueParser) Collect(prevState map[string]any) ([]Record, map[string
 			continue // index file, skip
 		}
 
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		fileMtime := info.ModTime().UTC().Format(time.RFC3339)
+
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
@@ -109,7 +118,7 @@ func (p *ContinueParser) Collect(prevState map[string]any) ([]Record, map[string
 			records = append(records, Record{
 				Source:    "continuedev",
 				SessionID: fmt.Sprintf("collector:continuedev:%s", session.SessionID),
-				Timestamp: "", // Continue.dev doesn't store per-message timestamps
+				Timestamp: fileMtime, // Use file mtime (Continue.dev lacks per-message timestamps)
 				Role:      role,
 				Content:   content,
 				AIVendor:  "Continue",
@@ -119,7 +128,12 @@ func (p *ContinueParser) Collect(prevState map[string]any) ([]Record, map[string
 		newProcessed = append(newProcessed, session.SessionID)
 	}
 
-	// Bound the processed set to prevent unbounded growth
+	// Bound the processed set to prevent unbounded growth.
+	// Sort to ensure deterministic truncation — newest IDs (added last via
+	// append) are at the end, so keeping the tail preserves recent sessions.
+	// Sorting also makes the order deterministic across runs regardless of
+	// Go's random map iteration order.
+	sort.Strings(newProcessed)
 	if len(newProcessed) > 5000 {
 		newProcessed = newProcessed[len(newProcessed)-5000:]
 	}

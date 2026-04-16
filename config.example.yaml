@@ -9,6 +9,8 @@ interval: 60
 # Set to 1-2 for "active sessions only" mode
 lookback: 24
 
+# Parsers for each AI tool. Each parser gracefully returns nothing if its
+# tool is not installed, so enabling all is safe.
 parsers:
   claude_code:
     enabled: true

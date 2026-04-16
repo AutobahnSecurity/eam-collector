@@ -5,8 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
+
+	"github.com/AutobahnSecurity/eam-collector/internal/platform"
 )
 
 // Record is the unified output format for all parsers.
@@ -28,21 +29,11 @@ type Record struct {
 	Identity     *AccountIdentity `json:"-"`
 }
 
-// Health reports the status of a parser after collection.
-type Health struct {
-	Parser   string `json:"parser"`
-	Status   string `json:"status"`    // "ok", "degraded", "error", "not_installed"
-	Records  int    `json:"records"`
-	Error    string `json:"error,omitempty"`
-	DataPath string `json:"data_path,omitempty"`
-}
-
 // Parser collects AI conversation records from a local tool.
 type Parser interface {
 	Name() string
 	SetLookback(hours int) // limit to sessions modified within N hours
 	Collect(state map[string]any) ([]Record, map[string]any, error)
-	DataDir() string // returns the path this parser reads from
 }
 
 // AccountIdentity holds the AI account info extracted from local tool data.
@@ -62,7 +53,7 @@ var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4
 // Each identity carries a Tool field matching the collector source it
 // governs, so the server can determine governance per-tool independently.
 func ReadClaudeIdentities() []AccountIdentity {
-	home, err := os.UserHomeDir()
+	home, err := platform.HomeDir()
 	if err != nil {
 		return nil
 	}
@@ -75,15 +66,6 @@ func ReadClaudeIdentities() []AccountIdentity {
 		ids = append(ids, *id)
 	}
 	return ids
-}
-
-// ReadClaudeIdentity returns the first identity found (backward compat).
-func ReadClaudeIdentity() *AccountIdentity {
-	ids := ReadClaudeIdentities()
-	if len(ids) == 0 {
-		return nil
-	}
-	return &ids[0]
 }
 
 func readStatsigIdentity(home string) *AccountIdentity {
@@ -160,15 +142,7 @@ func readStatsigIdentity(home string) *AccountIdentity {
 // Only the single most-recent pair is returned to avoid historical artifacts
 // from previously-used accounts/orgs.
 func readDesktopIdentity(home string) *AccountIdentity {
-	var appDir string
-	switch runtime.GOOS {
-	case "darwin":
-		appDir = filepath.Join(home, "Library", "Application Support", "Claude")
-	case "windows":
-		appDir = filepath.Join(home, "AppData", "Roaming", "Claude")
-	default:
-		appDir = filepath.Join(home, ".config", "Claude")
-	}
+	appDir := platform.ClaudeDesktopDir(home)
 
 	// Check both legacy and current Desktop session directories
 	sessionsDirs := []string{

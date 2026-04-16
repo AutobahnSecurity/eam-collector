@@ -1,5 +1,7 @@
 module github.com/AutobahnSecurity/eam-collector
 
+// NOTE: Go 1.25 requires the latest toolchain. If building from source with an
+// older Go version, update this to match your installed Go (e.g., go 1.23.0).
 go 1.25.0
 
 require (

@@ -2,11 +2,14 @@ package sender
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/AutobahnSecurity/eam-collector/internal/parsers"
@@ -29,23 +32,33 @@ type Response struct {
 }
 
 type Sender struct {
-	url    string
-	apiKey string
-	client *http.Client
+	url      string // ingest endpoint URL
+	healthURL string // health check endpoint URL
+	apiKey   string
+	client   *http.Client
 }
 
-func New(url, apiKey string) *Sender {
-	return &Sender{
-		url:    url + "/api/ingest",
-		apiKey: apiKey,
-		client: &http.Client{Timeout: 60 * time.Second},
+func New(baseURL, apiKey string) (*Sender, error) {
+	ingestURL, err := url.JoinPath(baseURL, "/api/ingest")
+	if err != nil {
+		return nil, fmt.Errorf("invalid server URL %q: %w", baseURL, err)
 	}
+	healthURL, err := url.JoinPath(baseURL, "/api/health")
+	if err != nil {
+		return nil, fmt.Errorf("invalid server URL %q: %w", baseURL, err)
+	}
+	return &Sender{
+		url:       ingestURL,
+		healthURL: healthURL,
+		apiKey:    apiKey,
+		client:    &http.Client{Timeout: 60 * time.Second},
+	}, nil
 }
 
 const batchSize = 500
 
 // Send posts records to the EAM server, automatically splitting into batches.
-func (s *Sender) Send(payload Payload) (*Response, error) {
+func (s *Sender) Send(ctx context.Context, payload Payload) (*Response, error) {
 	if len(payload.Records) == 0 {
 		return &Response{}, nil
 	}
@@ -64,8 +77,12 @@ func (s *Sender) Send(payload Payload) (*Response, error) {
 			Records:    payload.Records[i:end],
 			Identities: payload.Identities,
 		}
+		// Include billing data only in the first batch (per-device metadata, not per-record)
+		if i == 0 {
+			batch.BillingData = payload.BillingData
+		}
 
-		resp, err := s.sendBatch(batch)
+		resp, err := s.sendBatch(ctx, batch)
 		if err != nil {
 			return total, fmt.Errorf("batch %d-%d: %w", i, end, err)
 		}
@@ -77,7 +94,7 @@ func (s *Sender) Send(payload Payload) (*Response, error) {
 	return total, nil
 }
 
-func (s *Sender) sendBatch(payload Payload) (*Response, error) {
+func (s *Sender) sendBatch(ctx context.Context, payload Payload) (*Response, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal payload: %w", err)
@@ -86,12 +103,19 @@ func (s *Sender) sendBatch(payload Payload) (*Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			wait := time.Duration(attempt*2) * time.Second
+			// Exponential backoff with jitter: 1s, 2s, 4s base + up to 50% jitter
+			base := time.Duration(1<<uint(attempt)) * time.Second
+			jitter := time.Duration(rand.Int63n(int64(base / 2)))
+			wait := base + jitter
 			log.Printf("[sender] Retry %d after %s", attempt, wait)
-			time.Sleep(wait)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		}
 
-		req, err := http.NewRequest("POST", s.url, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, "POST", s.url, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("create request: %w", err)
 		}
@@ -104,8 +128,13 @@ func (s *Sender) sendBatch(payload Payload) (*Response, error) {
 			continue
 		}
 
-		respBody, _ := io.ReadAll(resp.Body)
+		// Cap response body read to 1MB to prevent OOM from malicious/buggy servers
+		respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("read response body: %w", err)
+			continue
+		}
 
 		if resp.StatusCode == 401 {
 			return nil, fmt.Errorf("authentication failed — check api_key in config")
@@ -129,15 +158,39 @@ func (s *Sender) sendBatch(payload Payload) (*Response, error) {
 }
 
 // Ping checks if the EAM server is reachable.
+// Tries GET /api/health first; falls back to a minimal POST /api/ingest
+// if the health endpoint returns 404 (older server versions).
 func (s *Sender) Ping() error {
-	req, err := http.NewRequest("POST", s.url, bytes.NewReader([]byte(`{"device_id":"ping","records":[]}`)))
+	// Try dedicated health endpoint first
+	req, err := http.NewRequest("GET", s.healthURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-EAM-Key", s.apiKey)
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("server unreachable: %w", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return fmt.Errorf("invalid API key")
+	}
+	// Health endpoint exists and responded
+	if resp.StatusCode != 404 {
+		return nil
+	}
+
+	// Fallback: older server without /api/health — use minimal ingest POST
+	req, err = http.NewRequest("POST", s.url, bytes.NewReader([]byte(`{"device_id":"ping","records":[]}`)))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-EAM-Key", s.apiKey)
 
-	resp, err := s.client.Do(req)
+	resp, err = s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("server unreachable: %w", err)
 	}

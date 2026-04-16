@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"syscall"
+	"sync"
 )
 
 // Store persists per-parser state (file offsets, processed IDs, etc.)
 // so the collector only ships new data on each run.
+// The mutex protects Data for goroutine safety if parsers are ever
+// collected concurrently.
 type Store struct {
+	mu   sync.Mutex
 	path string
 	Data map[string]map[string]any `json:"parsers"`
 	lock *os.File // flock handle
@@ -34,11 +37,17 @@ func (s *Store) Load() error {
 	if err != nil {
 		return fmt.Errorf("open lock file: %w", err)
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := acquireLock(f); err != nil {
 		f.Close()
 		return fmt.Errorf("another eam-collector instance is already running (lock: %s)", lockPath)
 	}
 	s.lock = f
+
+	// Write our PID to the lock file so --stop/--status can find us
+	f.Truncate(0)
+	f.Seek(0, 0)
+	fmt.Fprintf(f, "%d\n", os.Getpid())
+	f.Sync()
 
 	data, err := os.ReadFile(s.path)
 	if err != nil {
@@ -52,6 +61,9 @@ func (s *Store) Load() error {
 
 // Save writes state atomically (write to temp file, then rename).
 func (s *Store) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
 		return err
 	}
@@ -75,13 +87,16 @@ func (s *Store) Save() error {
 // Close releases the file lock.
 func (s *Store) Close() {
 	if s.lock != nil {
-		syscall.Flock(int(s.lock.Fd()), syscall.LOCK_UN)
+		releaseLock(s.lock)
 		s.lock.Close()
 		s.lock = nil
 	}
 }
 
 func (s *Store) Get(parser string) map[string]any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.Data[parser] == nil {
 		s.Data[parser] = make(map[string]any)
 	}
@@ -89,5 +104,25 @@ func (s *Store) Get(parser string) map[string]any {
 }
 
 func (s *Store) Set(parser string, state map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	s.Data[parser] = state
+}
+
+// LockPath returns the path to the lock file for this store.
+func (s *Store) LockPath() string {
+	return s.path + ".lock"
+}
+
+// ReadPID reads the PID of the running collector from the lock file.
+// Returns 0 if no PID is found or the file doesn't exist.
+func ReadPID(lockPath string) int {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return 0
+	}
+	var pid int
+	fmt.Sscanf(string(data), "%d", &pid)
+	return pid
 }

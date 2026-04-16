@@ -3,10 +3,12 @@ package parsers
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
-	"runtime"
 	"time"
+
+	"github.com/AutobahnSecurity/eam-collector/internal/platform"
 )
 
 type copilotSession struct {
@@ -34,8 +36,14 @@ func (p *CopilotParser) SetLookback(hours int) {
 }
 
 func NewCopilotParser() *CopilotParser {
+	home, err := platform.HomeDir()
+	if err != nil {
+		log.Printf("[copilot] Warning: %v", err)
+		home = ""
+	}
 	return &CopilotParser{
-		baseDir: copilotBaseDir(),
+		baseDir:  platform.CopilotBaseDir(home),
+		lookback: 24 * time.Hour,
 	}
 }
 
@@ -48,13 +56,23 @@ func (p *CopilotParser) Collect(prevState map[string]any) ([]Record, map[string]
 		return nil, prevState, nil
 	}
 
-	// Get previously processed file mtimes
+	// Get previously processed file mtimes and request counts
 	mtimes := make(map[string]string)
 	if raw, ok := prevState["file_mtimes"]; ok {
 		if m, ok := raw.(map[string]any); ok {
 			for k, v := range m {
 				if s, ok := v.(string); ok {
 					mtimes[k] = s
+				}
+			}
+		}
+	}
+	reqCounts := make(map[string]float64)
+	if raw, ok := prevState["request_counts"]; ok {
+		if m, ok := raw.(map[string]any); ok {
+			for k, v := range m {
+				if f, ok := v.(float64); ok {
+					reqCounts[k] = f
 				}
 			}
 		}
@@ -68,6 +86,7 @@ func (p *CopilotParser) Collect(prevState map[string]any) ([]Record, map[string]
 
 	var records []Record
 	newMtimes := make(map[string]string)
+	newReqCounts := make(map[string]float64)
 
 	for _, path := range files {
 		info, err := os.Stat(path)
@@ -83,19 +102,29 @@ func (p *CopilotParser) Collect(prevState map[string]any) ([]Record, map[string]
 		mtime := info.ModTime().UTC().Format(time.RFC3339)
 		if mtimes[path] == mtime {
 			newMtimes[path] = mtime
+			newReqCounts[path] = reqCounts[path]
 			continue // unchanged
 		}
 
 		recs, err := p.parseFile(path)
 		if err != nil {
-			newMtimes[path] = mtimes[path] // keep old mtime on error
+			newMtimes[path] = mtimes[path]
+			newReqCounts[path] = reqCounts[path]
 			continue
 		}
-		records = append(records, recs...)
+
+		// Only emit records beyond what we've already sent for this file.
+		// This avoids re-sending the entire session when a new message arrives.
+		prevCount := int(reqCounts[path])
+		if prevCount < len(recs) {
+			records = append(records, recs[prevCount:]...)
+		}
 		newMtimes[path] = mtime
+		newReqCounts[path] = float64(len(recs))
 	}
 
 	newState["file_mtimes"] = newMtimes
+	newState["request_counts"] = newReqCounts
 	return records, newState, nil
 }
 
@@ -147,14 +176,3 @@ func findCopilotFiles(baseDir string) ([]string, error) {
 	return filepath.Glob(pattern)
 }
 
-func copilotBaseDir() string {
-	home, _ := os.UserHomeDir()
-	switch runtime.GOOS {
-	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "Code", "User", "workspaceStorage")
-	case "windows":
-		return filepath.Join(home, "AppData", "Roaming", "Code", "User", "workspaceStorage")
-	default:
-		return filepath.Join(home, ".config", "Code", "User", "workspaceStorage")
-	}
-}
